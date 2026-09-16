@@ -153,15 +153,36 @@ font-weight:bold}.gray{background:#40506a}.hidden{display:none}#message{min-heig
 function showLogin(){registerBox.classList.add("hidden");loginBox.classList.remove("hidden");message.textContent=""}
 function showRegister(){loginBox.classList.add("hidden");registerBox.classList.remove("hidden");message.textContent=""}
 async function registerUser(){
- const data={name:name.value.trim(),phone:phone.value.trim(),email:email.value.trim(),
- location:location.value.trim(),device_id:device.value.trim(),password:password.value};
- const r=await fetch("/register",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});
- const d=await r.json();message.textContent=d.message;if(d.success) location.href="/dashboard";
+ const data={
+  name:document.getElementById("name").value.trim(),
+  phone:document.getElementById("phone").value.trim(),
+  email:document.getElementById("email").value.trim(),
+  location:document.getElementById("location").value.trim(),
+  device_id:document.getElementById("device").value.trim(),
+  password:document.getElementById("password").value
+ };
+ const r=await fetch("/register",{
+  method:"POST",
+  headers:{"Content-Type":"application/json"},
+  body:JSON.stringify(data)
+ });
+ const d=await r.json();
+ document.getElementById("message").textContent=d.message;
+ if(d.success) window.location.href="/dashboard";
 }
 async function loginUser(){
- const data={email:loginEmail.value.trim(),password:loginPassword.value};
- const r=await fetch("/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});
- const d=await r.json();message.textContent=d.message;if(d.success) location.href="/dashboard";
+ const data={
+  email:document.getElementById("loginEmail").value.trim(),
+  password:document.getElementById("loginPassword").value
+ };
+ const r=await fetch("/login",{
+  method:"POST",
+  headers:{"Content-Type":"application/json"},
+  body:JSON.stringify(data)
+ });
+ const d=await r.json();
+ document.getElementById("message").textContent=d.message;
+ if(d.success) window.location.href="/dashboard";
 }
 </script></body></html>
 """
@@ -211,17 +232,32 @@ const messaging=getMessaging(app);
 async function loadProfile(){
  const r=await fetch("/profile");const d=await r.json();
  if(!d.success){location.href="/";return}
- const u=d.user;userName.textContent=u.name||"User";userPhone.textContent=u.phone||"-";
- userDevice.textContent=u.device_id||"-";pName.value=u.name||"";pPhone.value=u.phone||"";
- pEmail.value=u.email||"";pLocation.value=u.location||"";pDevice.value=u.device_id||"";
+ const u=d.user;
+ document.getElementById("userName").textContent=u.name||"User";
+ document.getElementById("userPhone").textContent=u.phone||"-";
+ document.getElementById("userDevice").textContent=u.device_id||"-";
+ document.getElementById("pName").value=u.name||"";
+ document.getElementById("pPhone").value=u.phone||"";
+ document.getElementById("pEmail").value=u.email||"";
+ document.getElementById("pLocation").value=u.location||"";
+ document.getElementById("pDevice").value=u.device_id||"";
  updateStatus();
 }
-window.toggleProfile=()=>profile.classList.toggle("hidden");
+window.toggleProfile=()=>{
+ document.getElementById("profile").classList.toggle("hidden");
+};
 window.saveProfile=async()=>{
- const data={name:pName.value.trim(),phone:pPhone.value.trim(),email:pEmail.value.trim(),
- location:pLocation.value.trim(),device_id:pDevice.value.trim()};
+ const data={
+  name:document.getElementById("pName").value.trim(),
+  phone:document.getElementById("pPhone").value.trim(),
+  email:document.getElementById("pEmail").value.trim(),
+  location:document.getElementById("pLocation").value.trim(),
+  device_id:document.getElementById("pDevice").value.trim()
+ };
  const r=await fetch("/profile",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});
- const d=await r.json();profileMessage.textContent=d.message;loadProfile();
+ const d=await r.json();
+ document.getElementById("profileMessage").textContent=d.message;
+ loadProfile();
 };
 window.enableNotifications=async()=>{
  try{
@@ -242,9 +278,12 @@ onMessage(messaging,payload=>{
 });
 async function updateStatus(){
  const r=await fetch("/status");const d=await r.json();if(!d.success)return;
- system.textContent=d.fire?"FIRE DETECTED":"SAFE";system.className=d.fire?"value danger":"value safe";
- flame.textContent=d.flame;temperature.textContent=d.temperature+" °C";
- relay.textContent=d.extinguisher;notification.textContent=d.notification?"ENABLED":"OFF";
+ document.getElementById("system").textContent=d.fire?"FIRE DETECTED":"SAFE";
+ document.getElementById("system").className=d.fire?"value danger":"value safe";
+ document.getElementById("flame").textContent=d.flame;
+ document.getElementById("temperature").textContent=d.temperature+" °C";
+ document.getElementById("relay").textContent=d.extinguisher;
+ document.getElementById("notification").textContent=d.notification?"ENABLED":"OFF";
 }
 window.testFire=async()=>{const r=await fetch("/api/test-fire",{method:"POST"});const d=await r.json();result.textContent=d.message;updateStatus()};
 window.resetSystem=async()=>{const r=await fetch("/api/reset",{method:"POST"});const d=await r.json();result.textContent=d.message;updateStatus()};
