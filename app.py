@@ -17,7 +17,7 @@ FIREBASE_CONFIG = {
 }
 
 VAPID_KEY = (
-    "BDMQ6bqrix1EQOm7fOuz-PBd_jHarjFNl3WrQtmFYVg72scD_rwzvLleIwVw0jJ9"
+    "BEZbXaX4nW0phum1G9oJKEhQCUlV7CAK4aWMvHN1EzqkfBv4jeS3S6epCgJjhU9lKizq4SQScX1AGUSZt8z6qSE"
     "JXAxrlb0ygUSquZBWYBLm4I"
 )
 
