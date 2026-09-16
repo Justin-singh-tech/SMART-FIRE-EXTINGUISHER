@@ -1,36 +1,19 @@
+from flask import Flask, request, jsonify, render_template_string
 import os
 import json
-import uuid
-from datetime import datetime, timezone
 
-from flask import Flask, request, jsonify, render_template_string
 import firebase_admin
-from firebase_admin import credentials, firestore, messaging
+from firebase_admin import credentials, firestore, messaging, auth
+
 
 app = Flask(__name__)
 
-# ------------------------------------------------------------
-# Firebase Admin
-# ------------------------------------------------------------
-FIREBASE_SERVICE_ACCOUNT = os.getenv("FIREBASE_SERVICE_ACCOUNT", "")
-FIREBASE_VAPID_KEY = os.getenv("FIREBASE_VAPID_KEY", "")
+# ============================================================
+# FIREBASE CONFIG
+# ============================================================
 
-firebase_ready = False
-db = None
-
-if FIREBASE_SERVICE_ACCOUNT:
-    try:
-        service_account_info = json.loads(FIREBASE_SERVICE_ACCOUNT)
-        cred = credentials.Certificate(service_account_info)
-        firebase_admin.initialize_app(cred)
-        db = firestore.client()
-        firebase_ready = True
-    except Exception as e:
-        print("Firebase Admin initialization error:", e)
-
-# This is the WEB APP config you gave for your Firebase project.
 FIREBASE_CONFIG = {
-    "apiKey": "AIzaSyD1JM4e0Ztg3FUhCkA4tYh8UzEOYcdn9k",
+    "apiKey": "AIzaSyD1JM4e0Ztg3FUhCkC4t9Yh8UzEOYcdn9k",
     "authDomain": "smart-fire-project.firebaseapp.com",
     "projectId": "smart-fire-project",
     "storageBucket": "smart-fire-project.firebasestorage.app",
@@ -38,733 +21,2255 @@ FIREBASE_CONFIG = {
     "appId": "1:591246962485:web:2030ebe6c34a81f5bd667c"
 }
 
-# Temporary runtime status. Owner/device data is stored in Firestore.
-status = {
-    "fire": False,
-    "pump": False,
-    "last_event": None,
-    "device_id": None
-}
+VAPID_KEY = (
+    "BDMQ6bqrix1EQOm7fOuz-PBd_jHarjFNl3WrQtmFYVg72scD_rwzvLleIwVw0jJ9"
+    "JXAxrlb0ygUSquZBWYBLm4I"
+)
+
+db = None
 
 
-# ------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------
-def now_iso():
-    return datetime.now(timezone.utc).isoformat()
+# ============================================================
+# FIREBASE ADMIN
+# ============================================================
+
+try:
+    service_account = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
+
+    if service_account:
+        if not firebase_admin._apps:
+            firebase_admin.initialize_app(
+                credentials.Certificate(
+                    json.loads(service_account)
+                )
+            )
+
+        db = firestore.client()
+        print("Firebase Admin initialized successfully.")
+
+    else:
+        print("WARNING: FIREBASE_SERVICE_ACCOUNT is missing.")
+
+except Exception as error:
+    print("Firebase initialization error:", error)
 
 
-def owner_ref(device_id):
-    if not db or not device_id:
+# ============================================================
+# AUTHENTICATION HELPER
+# ============================================================
+
+def get_logged_in_user():
+    """
+    Reads the Firebase ID token from:
+    Authorization: Bearer <token>
+    """
+
+    header = request.headers.get("Authorization", "")
+
+    if not header.startswith("Bearer "):
         return None
-    return db.collection("owners").document(device_id)
 
+    token = header.split(" ", 1)[1]
 
-def clean_owner(data):
-    return {
-        "name": str(data.get("name", "")).strip(),
-        "phone": str(data.get("phone", "")).strip(),
-        "house": str(data.get("house", "")).strip(),
-        "device_id": str(data.get("device_id", "")).strip()
-    }
+    try:
+        return auth.verify_id_token(token)
+    except Exception:
+        return None
 
 
-# ------------------------------------------------------------
-# Main website
-# ------------------------------------------------------------
-HTML = r"""
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Smart Fire Guard</title>
+# ============================================================
+# FIRESTORE HELPERS
+# ============================================================
 
-<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-messaging-compat.js"></script>
+def get_user(uid):
+    if not db:
+        return {}
 
-<style>
-*{box-sizing:border-box}
-body{
-    margin:0;
-    font-family:Arial,Helvetica,sans-serif;
-    background:#f3f6fb;
-    color:#172033;
-}
-header{
-    background:linear-gradient(135deg,#d71920,#ff6b35);
-    color:white;
-    padding:28px 18px;
-    text-align:center;
-}
-header h1{margin:0 0 8px;font-size:32px}
-header p{margin:0;opacity:.95}
-.container{max-width:900px;margin:25px auto;padding:0 15px}
-.card{
-    background:white;
-    border-radius:18px;
-    padding:22px;
-    margin-bottom:18px;
-    box-shadow:0 5px 20px rgba(0,0,0,.08);
-}
-.hidden{display:none!important}
-h2{margin-top:0}
-input{
-    width:100%;
-    padding:13px;
-    margin:7px 0 12px;
-    border:1px solid #ccd3df;
-    border-radius:10px;
-    font-size:16px;
-}
-button{
-    border:0;
-    border-radius:10px;
-    padding:12px 16px;
-    margin:5px;
-    font-size:15px;
-    font-weight:bold;
-    cursor:pointer;
-}
-.primary{background:#d71920;color:white}
-.secondary{background:#e9eef6;color:#172033}
-.success{background:#14804a;color:white}
-.danger{background:#b42318;color:white}
-.status{
-    padding:20px;
-    border-radius:15px;
-    text-align:center;
-    font-size:22px;
-    font-weight:bold;
-    margin:15px 0;
-}
-.safe{background:#dff7e8;color:#116332}
-.fire{background:#ffe1e1;color:#a40e0e;animation:pulse 1s infinite}
-@keyframes pulse{50%{opacity:.65}}
-.grid{
-    display:grid;
-    grid-template-columns:repeat(auto-fit,minmax(180px,1fr));
-    gap:14px;
-}
-.stat{
-    padding:18px;
-    border-radius:14px;
-    background:#f1f5fa;
-}
-.stat b{display:block;font-size:20px;margin-top:7px}
-.small{font-size:13px;color:#647084}
-.alert{
-    padding:12px;
-    border-radius:10px;
-    background:#fff4d6;
-    color:#6d4d00;
-    margin-top:10px;
-    white-space:pre-wrap;
-}
-footer{text-align:center;color:#697386;padding:20px}
-</style>
-</head>
+    document = db.collection("users").document(uid).get()
 
-<body>
-<header>
-    <h1>🔥 Smart Fire Guard</h1>
-    <p>Automatic Fire Detection & Protection System</p>
-</header>
+    if document.exists:
+        return document.to_dict()
 
-<div class="container">
+    return {}
 
-<!-- Registration -->
-<section id="registerPage" class="card">
-    <h2>👤 Register Your Home</h2>
-    <p class="small">Register once on this device. When you return later, the website will open your dashboard automatically.</p>
 
-    <form id="registerForm">
-        <label>Owner Name</label>
-        <input id="name" required maxlength="80" placeholder="Enter owner name">
-
-        <label>Mobile Number</label>
-        <input id="phone" required maxlength="20" placeholder="Enter mobile number">
-
-        <label>House / Location Name</label>
-        <input id="house" required maxlength="100" placeholder="Example: My Home">
-
-        <button class="primary" type="submit">Register & Continue</button>
-    </form>
-
-    <div id="registerMsg" class="alert hidden"></div>
-</section>
-
-<!-- Dashboard -->
-<section id="dashboardPage" class="hidden">
-    <div class="card">
-        <h2>🏠 Owner Dashboard</h2>
-        <p id="welcome"></p>
-
-        <div id="mainStatus" class="status safe">🟢 SYSTEM SAFE</div>
-
-        <div class="grid">
-            <div class="stat">
-                🔥 Fire Sensor
-                <b id="fireValue">No Fire</b>
-            </div>
-            <div class="stat">
-                💧 Pump
-                <b id="pumpValue">OFF</b>
-            </div>
-            <div class="stat">
-                📡 Device
-                <b id="deviceValue">Connected</b>
-            </div>
-            <div class="stat">
-                🕒 Last Event
-                <b id="lastValue">None</b>
-            </div>
-        </div>
-    </div>
-
-    <div class="card">
-        <h2>🔔 Notifications</h2>
-        <p>Enable Firebase notifications on this device. The notification token is linked to this registered device.</p>
-        <button class="primary" onclick="enableNotifications()">Enable Notifications</button>
-        <div id="notificationMsg" class="alert hidden"></div>
-    </div>
-
-    <div class="card">
-        <h2>👤 Owner Information</h2>
-        <input id="editName" placeholder="Owner name">
-        <input id="editPhone" placeholder="Mobile number">
-        <input id="editHouse" placeholder="House / location">
-        <button class="success" onclick="saveOwner()">Save Changes</button>
-        <button class="secondary" onclick="logoutDevice()">Register Another Device</button>
-        <div id="ownerMsg" class="alert hidden"></div>
-    </div>
-
-    <div class="card">
-        <h2>🧪 Project Test</h2>
-        <p class="small">Use this only to test the website notification flow.</p>
-        <button class="danger" onclick="testFire()">Test Fire Alert</button>
-        <button class="secondary" onclick="resetFire()">Reset Status</button>
-        <div id="testMsg" class="alert hidden"></div>
-    </div>
-</section>
-
-<footer>Smart Fire Guard • School Project</footer>
-</div>
-
-<script>
-const firebaseConfig = {{ firebase_config | safe }};
-const vapidKey = {{ vapid_key | tojson }};
-
-let messaging = null;
-
-try {
-    firebase.initializeApp(firebaseConfig);
-    messaging = firebase.messaging();
-} catch(e) {
-    console.error(e);
-}
-
-function getDeviceId(){
-    let id = localStorage.getItem("smartFireDeviceId");
-    if(!id){
-        id = crypto.randomUUID ? crypto.randomUUID() :
-             ("device-" + Date.now() + "-" + Math.random().toString(16).slice(2));
-        localStorage.setItem("smartFireDeviceId", id);
-    }
-    return id;
-}
-
-function show(id, text){
-    const el = document.getElementById(id);
-    el.textContent = text;
-    el.classList.remove("hidden");
-}
-
-function hide(id){
-    document.getElementById(id).classList.add("hidden");
-}
-
-async function loadOwner(){
-    const deviceId = getDeviceId();
-
-    try{
-        const r = await fetch("/api/owner?device_id=" + encodeURIComponent(deviceId));
-        const data = await r.json();
-
-        if(data.registered){
-            showDashboard(data.owner);
-        }else{
-            document.getElementById("registerPage").classList.remove("hidden");
-            document.getElementById("dashboardPage").classList.add("hidden");
-        }
-    }catch(e){
-        show("registerMsg","Could not connect to the server. Please reload the page.");
-    }
-}
-
-function showDashboard(owner){
-    document.getElementById("registerPage").classList.add("hidden");
-    document.getElementById("dashboardPage").classList.remove("hidden");
-
-    document.getElementById("welcome").textContent =
-        "Welcome, " + owner.name + " • " + owner.house;
-
-    document.getElementById("editName").value = owner.name || "";
-    document.getElementById("editPhone").value = owner.phone || "";
-    document.getElementById("editHouse").value = owner.house || "";
-
-    loadStatus();
-}
-
-document.getElementById("registerForm").addEventListener("submit", async function(e){
-    e.preventDefault();
-
-    const owner = {
-        name: document.getElementById("name").value.trim(),
-        phone: document.getElementById("phone").value.trim(),
-        house: document.getElementById("house").value.trim(),
-        device_id: getDeviceId()
-    };
-
-    try{
-        const r = await fetch("/register",{
-            method:"POST",
-            headers:{"Content-Type":"application/json"},
-            body:JSON.stringify(owner)
-        });
-
-        const data = await r.json();
-
-        if(data.ok){
-            showDashboard(data.owner);
-        }else{
-            show("registerMsg", data.error || "Registration failed.");
-        }
-    }catch(e){
-        show("registerMsg","Registration failed. Check your internet connection.");
-    }
-});
-
-async function saveOwner(){
-    const owner = {
-        name: document.getElementById("editName").value.trim(),
-        phone: document.getElementById("editPhone").value.trim(),
-        house: document.getElementById("editHouse").value.trim(),
-        device_id: getDeviceId()
-    };
-
-    try{
-        const r = await fetch("/owner/update",{
-            method:"POST",
-            headers:{"Content-Type":"application/json"},
-            body:JSON.stringify(owner)
-        });
-        const data = await r.json();
-
-        if(data.ok){
-            show("ownerMsg","Owner information updated successfully.");
-            showDashboard(data.owner);
-        }else{
-            show("ownerMsg",data.error || "Could not save changes.");
-        }
-    }catch(e){
-        show("ownerMsg","Could not connect to server.");
-    }
-}
-
-function logoutDevice(){
-    if(confirm("This will remove this device's local registration and show registration again. Continue?")){
-        localStorage.removeItem("smartFireDeviceId");
-        localStorage.removeItem("fcmToken");
-        location.reload();
-    }
-}
-
-async function enableNotifications(){
-    if(!messaging){
-        show("notificationMsg","Firebase Messaging could not start.");
-        return;
-    }
-
-    if(!("Notification" in window)){
-        show("notificationMsg","This browser does not support notifications.");
-        return;
-    }
-
-    if(!("serviceWorker" in navigator)){
-        show("notificationMsg","This browser does not support service workers.");
-        return;
-    }
-
-    if(!vapidKey){
-        show("notificationMsg","Firebase VAPID public key is missing on the server. Add FIREBASE_VAPID_KEY in Render.");
-        return;
-    }
-
-    try{
-        const permission = await Notification.requestPermission();
-
-        if(permission !== "granted"){
-            show("notificationMsg","Notification permission was not granted. Allow notifications for this website and try again.");
-            return;
-        }
-
-        const registration = await navigator.serviceWorker.register("/firebase-messaging-sw.js");
-
-        const token = await messaging.getToken({
-            vapidKey: vapidKey,
-            serviceWorkerRegistration: registration
-        });
-
-        if(!token){
-            show("notificationMsg","Firebase did not return a notification token.");
-            return;
-        }
-
-        localStorage.setItem("fcmToken", token);
-
-        const r = await fetch("/save-fcm-token",{
-            method:"POST",
-            headers:{"Content-Type":"application/json"},
-            body:JSON.stringify({
-                device_id:getDeviceId(),
-                token:token
-            })
-        });
-
-        const data = await r.json();
-
-        if(data.ok){
-            show("notificationMsg","🔔 Notifications enabled on this device.");
-        }else{
-            show("notificationMsg",data.error || "Token could not be saved.");
-        }
-
-    }catch(e){
-        console.error(e);
-        show("notificationMsg",
-            "Notification setup failed.\n\n" +
-            (e.name || "Error") + ": " +
-            (e.message || String(e))
-        );
-    }
-}
-
-async function loadStatus(){
-    try{
-        const r = await fetch("/status");
-        const data = await r.json();
-
-        document.getElementById("fireValue").textContent =
-            data.fire ? "🔥 FIRE DETECTED" : "No Fire";
-
-        document.getElementById("pumpValue").textContent =
-            data.pump ? "ON" : "OFF";
-
-        document.getElementById("lastValue").textContent =
-            data.last_event || "None";
-
-        const box = document.getElementById("mainStatus");
-
-        if(data.fire){
-            box.className = "status fire";
-            box.textContent = "🔴 FIRE DETECTED";
-        }else{
-            box.className = "status safe";
-            box.textContent = "🟢 SYSTEM SAFE";
-        }
-    }catch(e){}
-}
-
-async function testFire(){
-    try{
-        const r = await fetch("/api/test-fire",{
-            method:"POST",
-            headers:{"Content-Type":"application/json"},
-            body:JSON.stringify({device_id:getDeviceId()})
-        });
-        const data = await r.json();
-        show("testMsg", data.message || data.error || "Test completed.");
-        loadStatus();
-    }catch(e){
-        show("testMsg","Test failed.");
-    }
-}
-
-async function resetFire(){
-    try{
-        await fetch("/api/reset",{method:"POST"});
-        loadStatus();
-        show("testMsg","System status reset.");
-    }catch(e){
-        show("testMsg","Reset failed.");
-    }
-}
-
-loadOwner();
-setInterval(loadStatus, 3000);
-</script>
-</body>
-</html>
-"""
-
-
-# ------------------------------------------------------------
-# Routes
-# ------------------------------------------------------------
-@app.route("/")
-def home():
-    return render_template_string(
-        HTML,
-        firebase_config=json.dumps(FIREBASE_CONFIG),
-        vapid_key=FIREBASE_VAPID_KEY
+def save_user(uid, data):
+    db.collection("users").document(uid).set(
+        data,
+        merge=True
     )
 
 
+def get_device(device_id):
+    if not db:
+        return {}
+
+    document = (
+        db.collection("devices")
+        .document(device_id)
+        .get()
+    )
+
+    if document.exists:
+        return document.to_dict()
+
+    return {}
+
+
+def get_user_tokens(uid):
+    if not db:
+        return []
+
+    documents = (
+        db.collection("fcm_tokens")
+        .where("uid", "==", uid)
+        .stream()
+    )
+
+    return [document.id for document in documents]
+
+
+# ============================================================
+# FIREBASE NOTIFICATION
+# ============================================================
+
+def send_fire_notification(uid, temperature, location):
+    """
+    Send notification ONLY to phones belonging to this user.
+    """
+
+    if not db:
+        print("Firebase/Firestore is not ready.")
+        return False
+
+    tokens = get_user_tokens(uid)
+
+    if not tokens:
+        print("No registered notification phone for user:", uid)
+        return False
+
+    sent = False
+
+    # FCM multicast supports up to 500 tokens per message.
+    for start in range(0, len(tokens), 500):
+
+        batch = tokens[start:start + 500]
+
+        message = messaging.MulticastMessage(
+            notification=messaging.Notification(
+                title="🔥 SMART FIRE GUARD",
+                body=(
+                    "FIRE DETECTED! "
+                    "Please check your location immediately."
+                )
+            ),
+            data={
+                "type": "fire_alert",
+                "temperature": str(temperature),
+                "location": str(location or "")
+            },
+            tokens=batch
+        )
+
+        try:
+            response = messaging.send_each_for_multicast(message)
+
+            print(
+                "FCM:",
+                response.success_count,
+                "sent,",
+                response.failure_count,
+                "failed."
+            )
+
+            if response.success_count > 0:
+                sent = True
+
+            # Remove invalid tokens.
+            for index, result in enumerate(response.responses):
+
+                if not result.success:
+                    token = batch[index]
+
+                    try:
+                        db.collection(
+                            "fcm_tokens"
+                        ).document(token).delete()
+                    except Exception:
+                        pass
+
+        except Exception as error:
+            print("FCM notification error:", error)
+
+    return sent
+
+
+# ============================================================
+# SERVICE WORKER
+# ============================================================
+
 @app.route("/firebase-messaging-sw.js")
 def firebase_messaging_sw():
-    # Compat SDK in the service worker is intentionally used because
-    # unbundled modular Firebase service workers need extra bundling.
-    sw = f"""
-importScripts('https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js');
-importScripts('https://www.gstatic.com/firebasejs/10.13.2/firebase-messaging-compat.js');
 
-firebase.initializeApp({json.dumps(FIREBASE_CONFIG)});
+    javascript = f"""
+importScripts(
+    "https://www.gstatic.com/firebasejs/12.19.0/firebase-app-compat.js"
+);
+
+importScripts(
+    "https://www.gstatic.com/firebasejs/12.19.0/firebase-messaging-compat.js"
+);
+
+firebase.initializeApp(
+    {json.dumps(FIREBASE_CONFIG)}
+);
+
 const messaging = firebase.messaging();
 
 messaging.onBackgroundMessage(function(payload) {{
-    const notification = payload.notification || {{}};
+
+    const title =
+        payload.notification?.title ||
+        "SMART FIRE GUARD";
+
+    const options = {{
+
+        body:
+            payload.notification?.body ||
+            "FIRE DETECTED! Please check immediately.",
+
+        data:
+            payload.data || {{}}
+    }};
 
     self.registration.showNotification(
-        notification.title || "🔥 Smart Fire Guard Alert",
-        {{
-            body: notification.body || "Fire detected at your registered home.",
-            icon: notification.icon || undefined
-        }}
+        title,
+        options
     );
 }});
 """
-    return sw, 200, {"Content-Type": "application/javascript; charset=utf-8"}
+
+    return javascript, 200, {
+        "Content-Type": "application/javascript"
+    }
 
 
-@app.route("/api/owner")
-def api_owner():
-    device_id = request.args.get("device_id", "").strip()
+# ============================================================
+# LOGIN / REGISTER PAGE
+# ============================================================
 
-    if not device_id:
-        return jsonify({"registered": False})
+AUTH_HTML = """
+<!DOCTYPE html>
 
-    if not db:
-        return jsonify({
-            "registered": False,
-            "error": "Database is not connected. Configure FIREBASE_SERVICE_ACCOUNT."
-        })
+<html>
 
-    snap = owner_ref(device_id).get()
+<head>
 
-    if not snap.exists:
-        return jsonify({"registered": False})
+<meta name="viewport"
+      content="width=device-width, initial-scale=1">
 
-    owner = snap.to_dict()
-    return jsonify({"registered": True, "owner": owner})
+<title>Smart Fire Guard</title>
+
+<style>
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+
+    margin: 0;
+
+    min-height: 100vh;
+
+    display: flex;
+
+    justify-content: center;
+
+    align-items: center;
+
+    font-family: Arial, sans-serif;
+
+    background: #101827;
+
+    color: white;
+}
+
+.card {
+
+    width: min(92%, 430px);
+
+    padding: 25px;
+
+    border-radius: 18px;
+
+    background: #1b2638;
+
+    box-shadow: 0 10px 30px rgba(0,0,0,.3);
+}
+
+h1 {
+    text-align: center;
+}
+
+input {
+
+    width: 100%;
+
+    padding: 13px;
+
+    margin: 6px 0;
+
+    border: 0;
+
+    border-radius: 9px;
+}
+
+button {
+
+    width: 100%;
+
+    padding: 13px;
+
+    margin: 6px 0;
+
+    border: 0;
+
+    border-radius: 9px;
+
+    background: #e63946;
+
+    color: white;
+
+    font-weight: bold;
+
+    cursor: pointer;
+}
+
+.gray {
+    background: #40506a;
+}
+
+.hidden {
+    display: none;
+}
+
+#message {
+    min-height: 25px;
+    margin-top: 10px;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="card">
+
+<h1>🔥 Smart Fire Guard</h1>
+
+<!-- REGISTER -->
+
+<div id="registerBox">
+
+<h2>Create Account</h2>
+
+<input
+    id="name"
+    placeholder="Full name"
+>
+
+<input
+    id="phone"
+    placeholder="Phone number"
+>
+
+<input
+    id="email"
+    type="email"
+    placeholder="Email"
+>
+
+<input
+    id="location"
+    placeholder="Location / House"
+>
+
+<input
+    id="deviceId"
+    placeholder="Device ID e.g. HOME001"
+>
+
+<input
+    id="password"
+    type="password"
+    placeholder="Password"
+>
+
+<button onclick="registerUser()">
+    Register
+</button>
+
+<button
+    class="gray"
+    onclick="showLogin()"
+>
+    Already registered? Login
+</button>
+
+</div>
 
 
-@app.route("/register", methods=["POST"])
+<!-- LOGIN -->
+
+<div id="loginBox" class="hidden">
+
+<h2>Login</h2>
+
+<input
+    id="loginEmail"
+    type="email"
+    placeholder="Email"
+>
+
+<input
+    id="loginPassword"
+    type="password"
+    placeholder="Password"
+>
+
+<button onclick="loginUser()">
+    Login
+</button>
+
+<button
+    class="gray"
+    onclick="showRegister()"
+>
+    Create new account
+</button>
+
+</div>
+
+
+<p id="message"></p>
+
+</div>
+
+
+<script type="module">
+
+import {
+    initializeApp
+}
+from
+"https://www.gstatic.com/firebasejs/12.19.0/firebase-app.js";
+
+
+import {
+    getAuth,
+    createUserWithEmailAndPassword,
+    signInWithEmailAndPassword,
+    onAuthStateChanged
+}
+from
+"https://www.gstatic.com/firebasejs/12.19.0/firebase-auth.js";
+
+
+const firebaseConfig = __FIREBASE_CONFIG__;
+
+const firebaseApp =
+    initializeApp(firebaseConfig);
+
+const auth =
+    getAuth(firebaseApp);
+
+
+const message =
+    document.getElementById("message");
+
+
+window.showLogin = function() {
+
+    registerBox.classList.add("hidden");
+
+    loginBox.classList.remove("hidden");
+
+    message.textContent = "";
+};
+
+
+window.showRegister = function() {
+
+    loginBox.classList.add("hidden");
+
+    registerBox.classList.remove("hidden");
+
+    message.textContent = "";
+};
+
+
+async function getHeaders() {
+
+    const token =
+        await auth.currentUser.getIdToken();
+
+    return {
+
+        "Authorization":
+            "Bearer " + token,
+
+        "Content-Type":
+            "application/json"
+    };
+}
+
+
+window.registerUser = async function() {
+
+    try {
+
+        const nameValue =
+            document.getElementById("name").value.trim();
+
+        const phoneValue =
+            document.getElementById("phone").value.trim();
+
+        const emailValue =
+            document.getElementById("email").value.trim();
+
+        const locationValue =
+            document.getElementById("location").value.trim();
+
+        const deviceValue =
+            document.getElementById("deviceId").value.trim();
+
+        const passwordValue =
+            document.getElementById("password").value;
+
+
+        if (
+            !nameValue ||
+            !phoneValue ||
+            !emailValue ||
+            !passwordValue
+        ) {
+
+            message.textContent =
+                "Please fill all required fields.";
+
+            return;
+        }
+
+
+        const result =
+            await createUserWithEmailAndPassword(
+                auth,
+                emailValue,
+                passwordValue
+            );
+
+
+        const response =
+            await fetch(
+                "/register",
+                {
+
+                    method: "POST",
+
+                    headers:
+                        await getHeaders(),
+
+                    body:
+                        JSON.stringify({
+
+                            name: nameValue,
+
+                            phone: phoneValue,
+
+                            email: emailValue,
+
+                            location:
+                                locationValue,
+
+                            device_id:
+                                deviceValue
+                        })
+                }
+            );
+
+
+        const data =
+            await response.json();
+
+
+        if (!response.ok) {
+
+            throw new Error(
+                data.message ||
+                "Could not save profile."
+            );
+        }
+
+
+        localStorage.setItem(
+            "smart_fire_logged_in",
+            "true"
+        );
+
+
+        window.location.href =
+            "/dashboard";
+
+    }
+
+    catch (error) {
+
+        message.textContent =
+            error.message;
+    }
+};
+
+
+window.loginUser = async function() {
+
+    try {
+
+        const emailValue =
+            document.getElementById(
+                "loginEmail"
+            ).value.trim();
+
+        const passwordValue =
+            document.getElementById(
+                "loginPassword"
+            ).value;
+
+
+        await signInWithEmailAndPassword(
+            auth,
+            emailValue,
+            passwordValue
+        );
+
+
+        localStorage.setItem(
+            "smart_fire_logged_in",
+            "true"
+        );
+
+
+        window.location.href =
+            "/dashboard";
+
+    }
+
+    catch (error) {
+
+        message.textContent =
+            error.message;
+    }
+};
+
+
+/*
+ Firebase Authentication keeps the login session.
+ If the user is already logged in,
+ send them directly to Dashboard.
+*/
+
+onAuthStateChanged(
+    auth,
+    function(user) {
+
+        if (
+            user &&
+            localStorage.getItem(
+                "smart_fire_logged_in"
+            ) === "true"
+        ) {
+
+            window.location.href =
+                "/dashboard";
+        }
+    }
+);
+
+</script>
+
+</body>
+
+</html>
+""".replace(
+    "__FIREBASE_CONFIG__",
+    json.dumps(FIREBASE_CONFIG)
+)
+
+
+# ============================================================
+# DASHBOARD
+# ============================================================
+
+DASHBOARD_HTML = """
+
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta name="viewport"
+      content="width=device-width, initial-scale=1">
+
+<title>Smart Fire Guard Dashboard</title>
+
+<style>
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+
+    margin: 0;
+
+    background: #101827;
+
+    color: white;
+
+    font-family: Arial, sans-serif;
+}
+
+header {
+
+    background: #1b2638;
+
+    padding: 16px;
+
+    display: flex;
+
+    justify-content: space-between;
+
+    align-items: center;
+}
+
+main {
+
+    width: min(95%, 900px);
+
+    margin: 20px auto;
+}
+
+.card {
+
+    background: #1b2638;
+
+    padding: 18px;
+
+    border-radius: 16px;
+
+    margin-bottom: 15px;
+}
+
+.grid {
+
+    display: grid;
+
+    grid-template-columns:
+        repeat(auto-fit, minmax(210px, 1fr));
+
+    gap: 15px;
+}
+
+.value {
+
+    font-size: 27px;
+
+    font-weight: bold;
+
+    margin-top: 8px;
+}
+
+.safe {
+    color: #58d68d;
+}
+
+.danger {
+    color: #ff6262;
+}
+
+button {
+
+    padding: 12px 16px;
+
+    margin: 5px;
+
+    border: 0;
+
+    border-radius: 9px;
+
+    background: #e63946;
+
+    color: white;
+
+    font-weight: bold;
+
+    cursor: pointer;
+}
+
+.gray {
+    background: #40506a;
+}
+
+input {
+
+    width: 100%;
+
+    padding: 12px;
+
+    margin: 5px 0;
+
+    border: 0;
+
+    border-radius: 9px;
+}
+
+.hidden {
+    display: none;
+}
+
+</style>
+
+</head>
+
+<body>
+
+
+<header>
+
+<strong>
+🔥 Smart Fire Guard
+</strong>
+
+<button
+    class="gray"
+    onclick="logout()"
+>
+Logout
+</button>
+
+</header>
+
+
+<main>
+
+
+<!-- USER -->
+
+<div class="card">
+
+<h2>
+Welcome,
+<span id="ownerName">User</span>
+</h2>
+
+<p>
+Registered phone:
+<span id="ownerPhone">-</span>
+</p>
+
+<button
+    class="gray"
+    onclick="toggleProfile()"
+>
+My Profile
+</button>
+
+<button
+    onclick="enableNotifications()"
+>
+Enable Notifications
+</button>
+
+</div>
+
+
+<!-- PROFILE -->
+
+<div
+    id="profileBox"
+    class="card hidden"
+>
+
+<h2>
+My Profile
+</h2>
+
+<input
+    id="profileName"
+    placeholder="Name"
+>
+
+<input
+    id="profilePhone"
+    placeholder="Phone"
+>
+
+<input
+    id="profileEmail"
+    placeholder="Email"
+>
+
+<input
+    id="profileLocation"
+    placeholder="Location"
+>
+
+<input
+    id="profileDevice"
+    placeholder="Device ID"
+>
+
+<button onclick="saveProfile()">
+Save Profile
+</button>
+
+<p id="profileMessage"></p>
+
+</div>
+
+
+<!-- STATUS -->
+
+<div class="grid">
+
+
+<div class="card">
+
+System
+
+<div
+    id="system"
+    class="value safe"
+>
+SAFE
+</div>
+
+</div>
+
+
+<div class="card">
+
+IR Sensor
+
+<div
+    id="flame"
+    class="value"
+>
+SAFE
+</div>
+
+</div>
+
+
+<div class="card">
+
+Temperature
+
+<div
+    id="temperature"
+    class="value"
+>
+0 °C
+</div>
+
+</div>
+
+
+<div class="card">
+
+Relay / Pump
+
+<div
+    id="relay"
+    class="value"
+>
+OFF
+</div>
+
+</div>
+
+
+<div class="card">
+
+Notification
+
+<div
+    id="notification"
+    class="value"
+>
+OFF
+</div>
+
+</div>
+
+
+<div class="card">
+
+Registered Phones
+
+<div
+    id="phoneCount"
+    class="value"
+>
+0
+</div>
+
+</div>
+
+
+</div>
+
+
+<!-- TEST -->
+
+<div class="card">
+
+<h2>
+System Test
+</h2>
+
+<button onclick="testFire()">
+TEST FIRE
+</button>
+
+<button
+    class="gray"
+    onclick="resetSystem()"
+>
+RESET
+</button>
+
+<p id="result"></p>
+
+</div>
+
+
+<!-- ESP8266 -->
+
+<div class="card">
+
+<h2>
+ESP8266 Device
+</h2>
+
+<p>
+
+Your registered Device ID is used to connect
+the NodeMCU to your account.
+
+</p>
+
+<p>
+
+When the ESP8266 sends a fire event,
+the server finds the owner of that Device ID
+and sends the Firebase notification only to
+that owner's registered phone.
+
+</p>
+
+</div>
+
+
+</main>
+
+
+<script type="module">
+
+import {
+    initializeApp
+}
+from
+"https://www.gstatic.com/firebasejs/12.19.0/firebase-app.js";
+
+
+import {
+    getAuth,
+    onAuthStateChanged,
+    signOut
+}
+from
+"https://www.gstatic.com/firebasejs/12.19.0/firebase-auth.js";
+
+
+import {
+    getMessaging,
+    getToken,
+    onMessage
+}
+from
+"https://www.gstatic.com/firebasejs/12.19.0/firebase-messaging.js";
+
+
+const firebaseConfig =
+    __FIREBASE_CONFIG__;
+
+
+const firebaseApp =
+    initializeApp(firebaseConfig);
+
+
+const auth =
+    getAuth(firebaseApp);
+
+
+const messaging =
+    getMessaging(firebaseApp);
+
+
+let currentUser = null;
+
+
+async function headers() {
+
+    const token =
+        await currentUser.getIdToken();
+
+    return {
+
+        "Authorization":
+            "Bearer " + token,
+
+        "Content-Type":
+            "application/json"
+    };
+}
+
+
+onAuthStateChanged(
+    auth,
+    async function(user) {
+
+        if (!user) {
+
+            localStorage.removeItem(
+                "smart_fire_logged_in"
+            );
+
+            window.location.href = "/";
+
+            return;
+        }
+
+
+        currentUser = user;
+
+
+        localStorage.setItem(
+            "smart_fire_logged_in",
+            "true"
+        );
+
+
+        await loadProfile();
+
+        await updateStatus();
+
+    }
+);
+
+
+async function loadProfile() {
+
+    const response =
+        await fetch(
+            "/profile",
+            {
+                headers:
+                    await headers()
+            }
+        );
+
+
+    const data =
+        await response.json();
+
+
+    if (!data.success) {
+        return;
+    }
+
+
+    const user =
+        data.user;
+
+
+    ownerName.textContent =
+        user.name || currentUser.email;
+
+
+    ownerPhone.textContent =
+        user.phone || "-";
+
+
+    profileName.value =
+        user.name || "";
+
+
+    profilePhone.value =
+        user.phone || "";
+
+
+    profileEmail.value =
+        user.email || currentUser.email || "";
+
+
+    profileLocation.value =
+        user.location || "";
+
+
+    profileDevice.value =
+        user.device_id || "";
+}
+
+
+window.toggleProfile = function() {
+
+    profileBox.classList.toggle(
+        "hidden"
+    );
+};
+
+
+window.saveProfile = async function() {
+
+    const response =
+        await fetch(
+            "/profile",
+            {
+
+                method: "POST",
+
+                headers:
+                    await headers(),
+
+                body:
+                    JSON.stringify({
+
+                        name:
+                            profileName.value.trim(),
+
+                        phone:
+                            profilePhone.value.trim(),
+
+                        email:
+                            profileEmail.value.trim(),
+
+                        location:
+                            profileLocation.value.trim(),
+
+                        device_id:
+                            profileDevice.value.trim()
+                    })
+            }
+        );
+
+
+    const data =
+        await response.json();
+
+
+    profileMessage.textContent =
+        data.message;
+
+
+    await loadProfile();
+};
+
+
+window.enableNotifications = async function() {
+
+    try {
+
+        if (!("Notification" in window)) {
+
+            alert(
+                "This browser does not support notifications."
+            );
+
+            return;
+        }
+
+
+        const permission =
+            await Notification.requestPermission();
+
+
+        if (permission !== "granted") {
+
+            alert(
+                "Notification permission was not granted."
+            );
+
+            return;
+        }
+
+
+        const registration =
+            await navigator.serviceWorker.register(
+                "/firebase-messaging-sw.js"
+            );
+
+
+        const token =
+            await getToken(
+                messaging,
+                {
+
+                    vapidKey:
+                        "__VAPID_KEY__",
+
+                    serviceWorkerRegistration:
+                        registration
+                }
+            );
+
+
+        if (!token) {
+
+            throw new Error(
+                "Firebase did not return a notification token."
+            );
+        }
+
+
+        const response =
+            await fetch(
+                "/save-fcm-token",
+                {
+
+                    method: "POST",
+
+                    headers:
+                        await headers(),
+
+                    body:
+                        JSON.stringify({
+                            token: token
+                        })
+                }
+            );
+
+
+        const data =
+            await response.json();
+
+
+        alert(
+            data.message
+        );
+
+
+        await updateStatus();
+
+    }
+
+    catch (error) {
+
+        alert(
+            "Notification error: " +
+            error.message
+        );
+    }
+};
+
+
+onMessage(
+    messaging,
+    function(payload) {
+
+        if (
+            Notification.permission ===
+            "granted"
+        ) {
+
+            new Notification(
+
+                payload.notification?.title ||
+                "SMART FIRE GUARD",
+
+                {
+
+                    body:
+                        payload.notification?.body ||
+                        "FIRE DETECTED!"
+                }
+            );
+        }
+    }
+);
+
+
+async function updateStatus() {
+
+    if (!currentUser) {
+        return;
+    }
+
+
+    const response =
+        await fetch(
+            "/status",
+            {
+                headers:
+                    await headers()
+            }
+        );
+
+
+    const data =
+        await response.json();
+
+
+    if (!data.success) {
+        return;
+    }
+
+
+    system.textContent =
+        data.fire
+            ? "FIRE DETECTED"
+            : "SAFE";
+
+
+    system.className =
+        "value " +
+        (
+            data.fire
+                ? "danger"
+                : "safe"
+        );
+
+
+    flame.textContent =
+        data.flame;
+
+
+    temperature.textContent =
+        data.temperature +
+        " °C";
+
+
+    relay.textContent =
+        data.extinguisher;
+
+
+    notification.textContent =
+        data.registered_tokens > 0
+            ? "ENABLED"
+            : "OFF";
+
+
+    phoneCount.textContent =
+        data.registered_tokens;
+}
+
+
+window.testFire = async function() {
+
+    const response =
+        await fetch(
+            "/api/test-fire",
+            {
+
+                method: "POST",
+
+                headers:
+                    await headers()
+            }
+        );
+
+
+    const data =
+        await response.json();
+
+
+    result.textContent =
+        data.message;
+
+
+    await updateStatus();
+};
+
+
+window.resetSystem = async function() {
+
+    const response =
+        await fetch(
+            "/api/reset",
+            {
+
+                method: "POST",
+
+                headers:
+                    await headers()
+            }
+        );
+
+
+    const data =
+        await response.json();
+
+
+    result.textContent =
+        data.message;
+
+
+    await updateStatus();
+};
+
+
+window.logout = async function() {
+
+    await signOut(auth);
+
+    localStorage.removeItem(
+        "smart_fire_logged_in"
+    );
+
+    window.location.href = "/";
+};
+
+
+setInterval(
+    updateStatus,
+    3000
+);
+
+</script>
+
+</body>
+
+</html>
+
+""".replace(
+    "__FIREBASE_CONFIG__",
+    json.dumps(FIREBASE_CONFIG)
+).replace(
+    "__VAPID_KEY__",
+    VAPID_KEY
+)
+
+
+# ============================================================
+# ROUTES
+# ============================================================
+
+@app.route("/")
+def home():
+
+    return render_template_string(
+        AUTH_HTML
+    )
+
+
+@app.route("/dashboard")
+def dashboard():
+
+    return render_template_string(
+        DASHBOARD_HTML
+    )
+
+
+# ============================================================
+# REGISTER USER
+# ============================================================
+
+@app.route(
+    "/register",
+    methods=["POST"]
+)
 def register():
-    data = request.get_json(silent=True) or {}
-    owner = clean_owner(data)
 
-    if not all([owner["name"], owner["phone"], owner["house"], owner["device_id"]]):
-        return jsonify({"ok": False, "error": "Please fill all registration fields."}), 400
+    user = get_logged_in_user()
 
-    if not db:
-        return jsonify({
-            "ok": False,
-            "error": "Database is not connected. Configure FIREBASE_SERVICE_ACCOUNT in Render."
-        }), 500
+    if not user:
 
-    ref = owner_ref(owner["device_id"])
-    existing = ref.get()
-
-    if existing.exists:
-        return jsonify({
-            "ok": False,
-            "error": "This device is already registered. Open the dashboard instead."
-        }), 409
-
-    owner["created_at"] = now_iso()
-    owner["updated_at"] = now_iso()
-
-    ref.set(owner)
-    return jsonify({"ok": True, "owner": owner})
+        return jsonify(
+            success=False,
+            message="Login required."
+        ), 401
 
 
-@app.route("/owner/update", methods=["POST"])
-def update_owner():
-    data = request.get_json(silent=True) or {}
-    owner = clean_owner(data)
-
-    if not all([owner["name"], owner["phone"], owner["house"], owner["device_id"]]):
-        return jsonify({"ok": False, "error": "Please fill all fields."}), 400
-
-    if not db:
-        return jsonify({"ok": False, "error": "Database is not connected."}), 500
-
-    ref = owner_ref(owner["device_id"])
-    snap = ref.get()
-
-    if not snap.exists:
-        return jsonify({"ok": False, "error": "Owner is not registered on this device."}), 404
-
-    owner["updated_at"] = now_iso()
-    ref.set(owner, merge=True)
-
-    return jsonify({"ok": True, "owner": ref.get().to_dict()})
+    data = request.get_json(
+        silent=True
+    ) or {}
 
 
-@app.route("/save-fcm-token", methods=["POST"])
+    uid = user["uid"]
+
+
+    name = data.get(
+        "name",
+        ""
+    ).strip()
+
+
+    phone = data.get(
+        "phone",
+        ""
+    ).strip()
+
+
+    email = data.get(
+        "email",
+        ""
+    ).strip()
+
+
+    location = data.get(
+        "location",
+        ""
+    ).strip()
+
+
+    device_id = data.get(
+        "device_id",
+        ""
+    ).strip()
+
+
+    if not name or not phone:
+
+        return jsonify(
+            success=False,
+            message="Name and phone are required."
+        ), 400
+
+
+    save_user(
+        uid,
+        {
+
+            "name": name,
+
+            "phone": phone,
+
+            "email": email,
+
+            "location": location,
+
+            "device_id": device_id
+        }
+    )
+
+
+    # Connect Device ID to this Firebase user.
+    if device_id:
+
+        db.collection(
+            "devices"
+        ).document(
+            device_id
+        ).set(
+
+            {
+
+                "owner_id": uid,
+
+                "device_id": device_id,
+
+                "name":
+                    "Smart Fire Guard"
+
+            },
+
+            merge=True
+        )
+
+
+    return jsonify(
+        success=True,
+        message="Registration saved successfully."
+    )
+
+
+# ============================================================
+# PROFILE
+# ============================================================
+
+@app.route(
+    "/profile",
+    methods=["GET", "POST"]
+)
+def profile():
+
+    user = get_logged_in_user()
+
+    if not user:
+
+        return jsonify(
+            success=False,
+            message="Login required."
+        ), 401
+
+
+    uid = user["uid"]
+
+
+    if request.method == "GET":
+
+        return jsonify(
+            success=True,
+            user=get_user(uid)
+        )
+
+
+    data = request.get_json(
+        silent=True
+    ) or {}
+
+
+    device_id = data.get(
+        "device_id",
+        ""
+    ).strip()
+
+
+    save_user(
+        uid,
+        {
+
+            "name":
+                data.get(
+                    "name",
+                    ""
+                ).strip(),
+
+            "phone":
+                data.get(
+                    "phone",
+                    ""
+                ).strip(),
+
+            "email":
+                data.get(
+                    "email",
+                    ""
+                ).strip(),
+
+            "location":
+                data.get(
+                    "location",
+                    ""
+                ).strip(),
+
+            "device_id":
+                device_id
+        }
+    )
+
+
+    if device_id:
+
+        db.collection(
+            "devices"
+        ).document(
+            device_id
+        ).set(
+
+            {
+
+                "owner_id": uid,
+
+                "device_id":
+                    device_id,
+
+                "name":
+                    "Smart Fire Guard"
+
+            },
+
+            merge=True
+        )
+
+
+    return jsonify(
+        success=True,
+        message="Profile updated successfully."
+    )
+
+
+# ============================================================
+# SAVE THIS PHONE'S FCM TOKEN
+# ============================================================
+
+@app.route(
+    "/save-fcm-token",
+    methods=["POST"]
+)
 def save_fcm_token():
-    data = request.get_json(silent=True) or {}
-    device_id = str(data.get("device_id", "")).strip()
-    token = str(data.get("token", "")).strip()
 
-    if not device_id or not token:
-        return jsonify({"ok": False, "error": "Device ID and token are required."}), 400
+    user = get_logged_in_user()
 
-    if not db:
-        return jsonify({"ok": False, "error": "Database is not connected."}), 500
+    if not user:
 
-    if not owner_ref(device_id).get().exists:
-        return jsonify({"ok": False, "error": "Register this device first."}), 404
+        return jsonify(
+            success=False,
+            message="Login required."
+        ), 401
 
-    # One document per browser/device token.
-    token_id = uuid.uuid5(uuid.NAMESPACE_URL, token).hex
 
-    db.collection("fcm_tokens").document(token_id).set({
-        "device_id": device_id,
-        "token": token,
-        "updated_at": now_iso()
-    }, merge=True)
+    data = request.get_json(
+        silent=True
+    ) or {}
 
-    return jsonify({"ok": True})
+
+    token = data.get(
+        "token",
+        ""
+    ).strip()
+
+
+    if not token:
+
+        return jsonify(
+            success=False,
+            message="FCM token is missing."
+        ), 400
+
+
+    # IMPORTANT:
+    # The token is connected to the currently
+    # authenticated Firebase user.
+    db.collection(
+        "fcm_tokens"
+    ).document(
+        token
+    ).set(
+
+        {
+
+            "uid":
+                user["uid"],
+
+            "email":
+                user.get(
+                    "email",
+                    ""
+                )
+        },
+
+        merge=True
+    )
+
+
+    return jsonify(
+        success=True,
+        message=(
+            "This phone is now registered "
+            "for fire notifications."
+        )
+    )
+
+
+# ============================================================
+# STATUS
+# ============================================================
+
+fire_status = {}
+
+
+def user_status(uid):
+
+    if uid not in fire_status:
+
+        fire_status[uid] = {
+
+            "fire": False,
+
+            "flame": "SAFE",
+
+            "temperature": 0,
+
+            "extinguisher": "OFF",
+
+            "notification_sent": False
+        }
+
+
+    return fire_status[uid]
 
 
 @app.route("/status")
-def get_status():
-    return jsonify(status)
+def status():
+
+    user = get_logged_in_user()
+
+    if not user:
+
+        return jsonify(
+            success=False
+        ), 401
 
 
-@app.route("/api/fire", methods=["POST"])
-def fire_detected():
-    """
-    ESP8266 should POST:
-    {
-      "device_id": "the registered device id",
-      "fire": true
-    }
+    uid = user["uid"]
 
-    For the school prototype, the device ID can be put in the ESP8266 code
-    after registering the website on the target device.
-    """
-    data = request.get_json(silent=True) or {}
-    device_id = str(data.get("device_id", "")).strip()
+    current = user_status(uid)
+
+
+    return jsonify(
+
+        success=True,
+
+        fire=current["fire"],
+
+        flame=current["flame"],
+
+        temperature=current["temperature"],
+
+        extinguisher=
+            current["extinguisher"],
+
+        notification_sent=
+            current["notification_sent"],
+
+        registered_tokens=
+            len(
+                get_user_tokens(uid)
+            )
+    )
+
+
+# ============================================================
+# ESP8266 FIRE API
+# ============================================================
+
+@app.route(
+    "/api/fire",
+    methods=["POST"]
+)
+def esp_fire():
+
+    data = request.get_json(
+        silent=True
+    ) or {}
+
+
+    device_id = data.get(
+        "device_id",
+        ""
+    ).strip()
+
 
     if not device_id:
-        return jsonify({"ok": False, "error": "device_id is required"}), 400
 
-    fire = bool(data.get("fire", True))
+        return jsonify(
 
-    status["fire"] = fire
-    status["pump"] = fire
-    status["last_event"] = now_iso()
-    status["device_id"] = device_id
+            success=False,
 
-    if not fire:
-        return jsonify({"ok": True, "message": "Fire status cleared."})
+            message=
+                "device_id is required."
 
-    # Send only to notification tokens registered to this same device ID.
-    sent = 0
-    failed = 0
+        ), 400
 
-    if db and firebase_ready:
-        try:
-            docs = (
-                db.collection("fcm_tokens")
-                .where("device_id", "==", device_id)
-                .stream()
+
+    if not db:
+
+        return jsonify(
+
+            success=False,
+
+            message=
+                "Firebase is not configured."
+
+        ), 500
+
+
+    # Find which Firebase user owns this device.
+    device = get_device(
+        device_id
+    )
+
+
+    uid = device.get(
+        "owner_id"
+    )
+
+
+    if not uid:
+
+        return jsonify(
+
+            success=False,
+
+            message=
+                "This ESP8266 device is not registered."
+
+        ), 404
+
+
+    fire = bool(
+        data.get(
+            "fire",
+            False
+        )
+    )
+
+
+    flame = data.get(
+        "flame",
+        "DETECTED"
+    )
+
+
+    temperature = data.get(
+        "temperature",
+        0
+    )
+
+
+    current = user_status(
+        uid
+    )
+
+
+    current["temperature"] = (
+        temperature
+    )
+
+
+    if fire:
+
+        current["fire"] = True
+
+        current["flame"] = (
+            "DETECTED"
+        )
+
+        current["extinguisher"] = (
+            "ACTIVATED"
+        )
+
+
+        # Send only once for this fire event.
+        if not current[
+            "notification_sent"
+        ]:
+
+            owner = get_user(
+                uid
             )
 
-            for doc in docs:
-                item = doc.to_dict()
-                token = item.get("token")
 
-                if not token:
-                    continue
+            sent = send_fire_notification(
 
-                message = messaging.Message(
-                    notification=messaging.Notification(
-                        title="🔥 FIRE DETECTED",
-                        body="Smart Fire Guard detected a fire at your registered home."
-                    ),
-                    data={
-                        "type": "fire",
-                        "device_id": device_id
-                    },
-                    token=token
+                uid,
+
+                temperature,
+
+                owner.get(
+                    "location",
+                    ""
                 )
-
-                try:
-                    messaging.send(message)
-                    sent += 1
-                except Exception as e:
-                    failed += 1
-                    print("FCM send error:", e)
-
-        except Exception as e:
-            print("FCM lookup error:", e)
-
-    return jsonify({
-        "ok": True,
-        "fire": True,
-        "notification_sent": sent,
-        "notification_failed": failed
-    })
+            )
 
 
-@app.route("/api/test-fire", methods=["POST"])
+            if sent:
+
+                current[
+                    "notification_sent"
+                ] = True
+
+
+        return jsonify(
+
+            success=True,
+
+            fire=True,
+
+            message=(
+                "Fire detected. "
+                "Alert sent to the "
+                "registered user's phone."
+            )
+        )
+
+
+    # No fire.
+    current["fire"] = False
+
+    current["flame"] = flame
+
+    current["extinguisher"] = "OFF"
+
+
+    return jsonify(
+
+        success=True,
+
+        fire=False,
+
+        message="System is safe."
+    )
+
+
+# ============================================================
+# TEST FIRE FROM DASHBOARD
+# ============================================================
+
+@app.route(
+    "/api/test-fire",
+    methods=["POST"]
+)
 def test_fire():
-    data = request.get_json(silent=True) or {}
-    device_id = str(data.get("device_id", "")).strip()
 
-    if not device_id:
-        return jsonify({"ok": False, "error": "Device ID is missing."}), 400
+    user = get_logged_in_user()
 
-    # Reuse the real fire-notification logic.
-    with app.test_request_context(
-        "/api/fire",
-        method="POST",
-        json={"device_id": device_id, "fire": True}
-    ):
-        return fire_detected()
+    if not user:
+
+        return jsonify(
+            success=False,
+            message="Login required."
+        ), 401
 
 
-@app.route("/api/reset", methods=["POST"])
+    uid = user["uid"]
+
+    current = user_status(
+        uid
+    )
+
+
+    current["fire"] = True
+
+    current["flame"] = (
+        "DETECTED"
+    )
+
+    current["temperature"] = 82
+
+    current["extinguisher"] = (
+        "ACTIVATED"
+    )
+
+
+    if not current[
+        "notification_sent"
+    ]:
+
+        owner = get_user(
+            uid
+        )
+
+
+        sent = send_fire_notification(
+
+            uid,
+
+            82,
+
+            owner.get(
+                "location",
+                ""
+            )
+        )
+
+
+        if sent:
+
+            current[
+                "notification_sent"
+            ] = True
+
+
+    return jsonify(
+
+        success=True,
+
+        message=
+            "Test fire activated."
+    )
+
+
+# ============================================================
+# RESET
+# ============================================================
+
+@app.route(
+    "/api/reset",
+    methods=["POST"]
+)
 def reset():
-    status["fire"] = False
-    status["pump"] = False
-    status["last_event"] = now_iso()
-    return jsonify({"ok": True})
 
+    user = get_logged_in_user()
+
+    if not user:
+
+        return jsonify(
+            success=False,
+            message="Login required."
+        ), 401
+
+
+    uid = user["uid"]
+
+
+    fire_status[uid] = {
+
+        "fire": False,
+
+        "flame": "SAFE",
+
+        "temperature": 0,
+
+        "extinguisher": "OFF",
+
+        "notification_sent": False
+    }
+
+
+    return jsonify(
+
+        success=True,
+
+        message=
+            "System reset successfully."
+    )
+
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
 
 @app.route("/health")
 def health():
-    return jsonify({
-        "ok": True,
-        "firebase_admin": firebase_ready,
-        "database": bool(db),
-        "vapid_key_configured": bool(FIREBASE_VAPID_KEY)
-    })
 
+    return jsonify(
+
+        status="ok",
+
+        firebase=
+            bool(db)
+    )
+
+
+# ============================================================
+# START
+# ============================================================
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            5000
+        )
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
