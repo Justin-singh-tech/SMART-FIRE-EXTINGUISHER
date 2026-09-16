@@ -8,13 +8,13 @@ app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-this-secret-key")
 
 # Firebase is used ONLY for push notifications.
 FIREBASE_CONFIG = {
-    "apiKey": "AIzaSyD1JM4e0Ztg3FUhCkC4tY9h8UzEOYcdn9k",
-    "authDomain": "smart-fire-project.firebaseapp.com",
-    "projectId": "smart-fire-project",
-    "storageBucket": "smart-fire-project.firebasestorage.app",
-    "messagingSenderId": "591246962485",
-    "appId": "1:591246962485:web:2030ebe6c34a81f5bd667c"
-}
+  apiKey: "AIzaSyAi0Ugg_3UOtxaoCzET4BCJZ0gFfkl4_6Q",
+  authDomain: "smart-fire-extinguisher-23625.firebaseapp.com",
+  projectId: "smart-fire-extinguisher-23625",
+  storageBucket: "smart-fire-extinguisher-23625.firebasestorage.app",
+  messagingSenderId: "985046588485",
+  appId: "1:985046588485:web:3fd7e8a3f4aa8f2f61572c"
+};
 
 VAPID_KEY = (
     "BDMQ6bqrix1EQOm7fOuz-PBd_jHarjFNl3WrQtmFYVg72scD_rwzvLleIwVw0jJ9"
