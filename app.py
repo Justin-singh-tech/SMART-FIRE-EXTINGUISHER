@@ -1,19 +1,27 @@
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, session
 import os
-import json
+import secrets
+import hashlib
 
 import firebase_admin
-from firebase_admin import credentials, firestore, messaging, auth
+from firebase_admin import credentials, messaging
 
 
 app = Flask(__name__)
 
+# Change this to a long random secret before deployment.
+app.secret_key = os.environ.get(
+    "FLASK_SECRET_KEY",
+    "smart-fire-guard-secret-change-me"
+)
+
+
 # ============================================================
-# FIREBASE CONFIG
+# FIREBASE - ONLY FOR NOTIFICATIONS
 # ============================================================
 
 FIREBASE_CONFIG = {
-    "apiKey": "AIzaSyD1JM4e0Ztg3FUhCkC4t9Yh8UzEOYcdn9k",
+    "apiKey": "YOUR_FIREBASE_WEB_API_KEY",
     "authDomain": "smart-fire-project.firebaseapp.com",
     "projectId": "smart-fire-project",
     "storageBucket": "smart-fire-project.firebasestorage.app",
@@ -26,207 +34,234 @@ VAPID_KEY = (
     "JXAxrlb0ygUSquZBWYBLm4I"
 )
 
-db = None
 
-
-# ============================================================
-# FIREBASE ADMIN
-# ============================================================
+firebase_ready = False
 
 try:
-    service_account = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
+    service_account = os.environ.get(
+        "FIREBASE_SERVICE_ACCOUNT"
+    )
 
     if service_account:
+
         if not firebase_admin._apps:
+
             firebase_admin.initialize_app(
                 credentials.Certificate(
-                    json.loads(service_account)
+                    __import__("json").loads(
+                        service_account
+                    )
                 )
             )
 
-        db = firestore.client()
-        print("Firebase Admin initialized successfully.")
+        firebase_ready = True
+
+        print("Firebase notification system ready.")
 
     else:
-        print("WARNING: FIREBASE_SERVICE_ACCOUNT is missing.")
+        print(
+            "WARNING: FIREBASE_SERVICE_ACCOUNT "
+            "not found."
+        )
 
 except Exception as error:
-    print("Firebase initialization error:", error)
 
-
-# ============================================================
-# AUTHENTICATION HELPER
-# ============================================================
-
-def get_logged_in_user():
-    """
-    Reads the Firebase ID token from:
-    Authorization: Bearer <token>
-    """
-
-    header = request.headers.get("Authorization", "")
-
-    if not header.startswith("Bearer "):
-        return None
-
-    token = header.split(" ", 1)[1]
-
-    try:
-        return auth.verify_id_token(token)
-    except Exception:
-        return None
-
-
-# ============================================================
-# FIRESTORE HELPERS
-# ============================================================
-
-def get_user(uid):
-    if not db:
-        return {}
-
-    document = db.collection("users").document(uid).get()
-
-    if document.exists:
-        return document.to_dict()
-
-    return {}
-
-
-def save_user(uid, data):
-    db.collection("users").document(uid).set(
-        data,
-        merge=True
+    print(
+        "Firebase initialization error:",
+        error
     )
 
 
-def get_device(device_id):
-    if not db:
-        return {}
+# ============================================================
+# SIMPLE IN-MEMORY USER STORAGE
+# ============================================================
 
-    document = (
-        db.collection("devices")
-        .document(device_id)
-        .get()
-    )
+users = {}
 
-    if document.exists:
-        return document.to_dict()
+"""
+Example:
 
-    return {}
+users = {
+    "user_id": {
+        "name": "Justin",
+        "phone": "1234567890",
+        "email": "abc@gmail.com",
+        "location": "Home",
+        "device_id": "fire1",
+        "password": "hashed password",
+        "fcm_tokens": []
+    }
+}
+"""
 
 
-def get_user_tokens(uid):
-    if not db:
-        return []
+def hash_password(password):
 
-    documents = (
-        db.collection("fcm_tokens")
-        .where("uid", "==", uid)
-        .stream()
-    )
+    return hashlib.sha256(
+        password.encode()
+    ).hexdigest()
 
-    return [document.id for document in documents]
+
+def find_user_by_email(email):
+
+    for user_id, user in users.items():
+
+        if user["email"].lower() == email.lower():
+
+            return user_id, user
+
+    return None, None
+
+
+def current_user():
+
+    user_id = session.get("user_id")
+
+    if not user_id:
+        return None, None
+
+    user = users.get(user_id)
+
+    if not user:
+        session.clear()
+        return None, None
+
+    return user_id, user
 
 
 # ============================================================
-# FIREBASE NOTIFICATION
+# FIRE NOTIFICATION
 # ============================================================
 
-def send_fire_notification(uid, temperature, location):
-    """
-    Send notification ONLY to phones belonging to this user.
-    """
+def send_notification(user, temperature):
 
-    if not db:
-        print("Firebase/Firestore is not ready.")
+    if not firebase_ready:
+
+        print(
+            "Firebase is not ready."
+        )
+
         return False
 
-    tokens = get_user_tokens(uid)
+
+    tokens = user.get(
+        "fcm_tokens",
+        []
+    )
+
 
     if not tokens:
-        print("No registered notification phone for user:", uid)
+
+        print(
+            "No notification phone registered."
+        )
+
         return False
+
 
     sent = False
 
-    # FCM multicast supports up to 500 tokens per message.
-    for start in range(0, len(tokens), 500):
 
-        batch = tokens[start:start + 500]
-
-        message = messaging.MulticastMessage(
-            notification=messaging.Notification(
-                title="🔥 SMART FIRE GUARD",
-                body=(
-                    "FIRE DETECTED! "
-                    "Please check your location immediately."
-                )
-            ),
-            data={
-                "type": "fire_alert",
-                "temperature": str(temperature),
-                "location": str(location or "")
-            },
-            tokens=batch
-        )
+    for token in tokens:
 
         try:
-            response = messaging.send_each_for_multicast(message)
 
-            print(
-                "FCM:",
-                response.success_count,
-                "sent,",
-                response.failure_count,
-                "failed."
+            message = messaging.Message(
+
+                notification=messaging.Notification(
+
+                    title="🔥 SMART FIRE GUARD",
+
+                    body=(
+                        "FIRE DETECTED! "
+                        "Please check immediately."
+                    )
+                ),
+
+                data={
+
+                    "type": "fire_alert",
+
+                    "temperature":
+                        str(temperature),
+
+                    "location":
+                        user.get(
+                            "location",
+                            ""
+                        )
+                },
+
+                token=token
             )
 
-            if response.success_count > 0:
-                sent = True
 
-            # Remove invalid tokens.
-            for index, result in enumerate(response.responses):
+            messaging.send(message)
 
-                if not result.success:
-                    token = batch[index]
+            sent = True
 
-                    try:
-                        db.collection(
-                            "fcm_tokens"
-                        ).document(token).delete()
-                    except Exception:
-                        pass
+            print(
+                "Fire notification sent to:",
+                user["name"]
+            )
+
 
         except Exception as error:
-            print("FCM notification error:", error)
+
+            print(
+                "Notification error:",
+                error
+            )
+
 
     return sent
 
 
 # ============================================================
-# SERVICE WORKER
+# FIRE STATUS
 # ============================================================
 
-@app.route("/firebase-messaging-sw.js")
-def firebase_messaging_sw():
+fire_status = {
+
+    "fire": False,
+
+    "flame": "SAFE",
+
+    "temperature": 0,
+
+    "extinguisher": "OFF",
+
+    "notification_sent": False
+}
+
+
+# ============================================================
+# FIREBASE SERVICE WORKER
+# ============================================================
+
+@app.route(
+    "/firebase-messaging-sw.js"
+)
+def firebase_service_worker():
 
     javascript = f"""
 importScripts(
-    "https://www.gstatic.com/firebasejs/12.19.0/firebase-app-compat.js"
+"https://www.gstatic.com/firebasejs/12.19.0/firebase-app-compat.js"
 );
 
 importScripts(
-    "https://www.gstatic.com/firebasejs/12.19.0/firebase-messaging-compat.js"
+"https://www.gstatic.com/firebasejs/12.19.0/firebase-messaging-compat.js"
 );
 
 firebase.initializeApp(
-    {json.dumps(FIREBASE_CONFIG)}
+{FIREBASE_CONFIG}
 );
 
-const messaging = firebase.messaging();
+const messaging =
+firebase.messaging();
 
-messaging.onBackgroundMessage(function(payload) {{
+messaging.onBackgroundMessage(
+function(payload) {{
 
     const title =
         payload.notification?.title ||
@@ -250,7 +285,8 @@ messaging.onBackgroundMessage(function(payload) {{
 """
 
     return javascript, 200, {
-        "Content-Type": "application/javascript"
+        "Content-Type":
+            "application/javascript"
     }
 
 
@@ -259,6 +295,7 @@ messaging.onBackgroundMessage(function(payload) {{
 # ============================================================
 
 AUTH_HTML = """
+
 <!DOCTYPE html>
 
 <html>
@@ -266,15 +303,11 @@ AUTH_HTML = """
 <head>
 
 <meta name="viewport"
-      content="width=device-width, initial-scale=1">
+content="width=device-width, initial-scale=1">
 
 <title>Smart Fire Guard</title>
 
 <style>
-
-* {
-    box-sizing: border-box;
-}
 
 body {
 
@@ -288,28 +321,22 @@ body {
 
     align-items: center;
 
-    font-family: Arial, sans-serif;
-
     background: #101827;
 
     color: white;
+
+    font-family: Arial;
 }
 
 .card {
 
     width: min(92%, 430px);
 
+    background: #1b2638;
+
     padding: 25px;
 
     border-radius: 18px;
-
-    background: #1b2638;
-
-    box-shadow: 0 10px 30px rgba(0,0,0,.3);
-}
-
-h1 {
-    text-align: center;
 }
 
 input {
@@ -320,9 +347,11 @@ input {
 
     margin: 6px 0;
 
+    box-sizing: border-box;
+
     border: 0;
 
-    border-radius: 9px;
+    border-radius: 8px;
 }
 
 button {
@@ -335,28 +364,23 @@ button {
 
     border: 0;
 
-    border-radius: 9px;
+    border-radius: 8px;
 
     background: #e63946;
 
     color: white;
 
     font-weight: bold;
-
-    cursor: pointer;
 }
 
 .gray {
+
     background: #40506a;
 }
 
 .hidden {
-    display: none;
-}
 
-#message {
-    min-height: 25px;
-    margin-top: 10px;
+    display: none;
 }
 
 </style>
@@ -369,85 +393,85 @@ button {
 
 <h1>🔥 Smart Fire Guard</h1>
 
-<!-- REGISTER -->
 
 <div id="registerBox">
 
 <h2>Create Account</h2>
 
 <input
-    id="name"
-    placeholder="Full name"
+id="name"
+placeholder="Full Name"
 >
 
 <input
-    id="phone"
-    placeholder="Phone number"
+id="phone"
+placeholder="Phone Number"
 >
 
 <input
-    id="email"
-    type="email"
-    placeholder="Email"
+id="email"
+type="email"
+placeholder="Email"
 >
 
 <input
-    id="location"
-    placeholder="Location / House"
+id="location"
+placeholder="Location"
 >
 
 <input
-    id="deviceId"
-    placeholder="Device ID e.g. HOME001"
+id="device"
+placeholder="Device ID"
 >
 
 <input
-    id="password"
-    type="password"
-    placeholder="Password"
+id="password"
+type="password"
+placeholder="Password"
 >
 
 <button onclick="registerUser()">
-    Register
+Register
 </button>
 
 <button
-    class="gray"
-    onclick="showLogin()"
+class="gray"
+onclick="showLogin()"
 >
-    Already registered? Login
+Already registered? Login
 </button>
 
 </div>
 
 
-<!-- LOGIN -->
-
-<div id="loginBox" class="hidden">
+<div
+id="loginBox"
+class="hidden"
+>
 
 <h2>Login</h2>
 
 <input
-    id="loginEmail"
-    type="email"
-    placeholder="Email"
+id="loginEmail"
+type="email"
+placeholder="Email"
 >
 
 <input
-    id="loginPassword"
-    type="password"
-    placeholder="Password"
+id="loginPassword"
+type="password"
+placeholder="Password"
 >
 
 <button onclick="loginUser()">
-    Login
+Login
 </button>
 
 <button
-    class="gray"
-    onclick="showRegister()"
+class="gray"
+onclick="showRegister()"
 >
-    Create new account
+Create Account
 </button>
 
 </div>
@@ -458,253 +482,162 @@ button {
 </div>
 
 
-<script type="module">
+<script>
 
-import {
-    initializeApp
+function showLogin() {
+
+    registerBox.classList.add(
+        "hidden"
+    );
+
+    loginBox.classList.remove(
+        "hidden"
+    );
 }
-from
-"https://www.gstatic.com/firebasejs/12.19.0/firebase-app.js";
 
 
-import {
-    getAuth,
-    createUserWithEmailAndPassword,
-    signInWithEmailAndPassword,
-    onAuthStateChanged
+function showRegister() {
+
+    loginBox.classList.add(
+        "hidden"
+    );
+
+    registerBox.classList.remove(
+        "hidden"
+    );
 }
-from
-"https://www.gstatic.com/firebasejs/12.19.0/firebase-auth.js";
 
 
-const firebaseConfig = __FIREBASE_CONFIG__;
+async function registerUser() {
 
-const firebaseApp =
-    initializeApp(firebaseConfig);
+    const data = {
 
-const auth =
-    getAuth(firebaseApp);
+        name:
+            document.getElementById(
+                "name"
+            ).value,
 
+        phone:
+            document.getElementById(
+                "phone"
+            ).value,
 
-const message =
-    document.getElementById("message");
+        email:
+            document.getElementById(
+                "email"
+            ).value,
 
+        location:
+            document.getElementById(
+                "location"
+            ).value,
 
-window.showLogin = function() {
+        device_id:
+            document.getElementById(
+                "device"
+            ).value,
 
-    registerBox.classList.add("hidden");
-
-    loginBox.classList.remove("hidden");
-
-    message.textContent = "";
-};
-
-
-window.showRegister = function() {
-
-    loginBox.classList.add("hidden");
-
-    registerBox.classList.remove("hidden");
-
-    message.textContent = "";
-};
-
-
-async function getHeaders() {
-
-    const token =
-        await auth.currentUser.getIdToken();
-
-    return {
-
-        "Authorization":
-            "Bearer " + token,
-
-        "Content-Type":
-            "application/json"
+        password:
+            document.getElementById(
+                "password"
+            ).value
     };
-}
 
 
-window.registerUser = async function() {
+    const response =
+        await fetch(
+            "/register",
+            {
 
-    try {
+                method: "POST",
 
-        const nameValue =
-            document.getElementById("name").value.trim();
+                headers: {
+                    "Content-Type":
+                        "application/json"
+                },
 
-        const phoneValue =
-            document.getElementById("phone").value.trim();
-
-        const emailValue =
-            document.getElementById("email").value.trim();
-
-        const locationValue =
-            document.getElementById("location").value.trim();
-
-        const deviceValue =
-            document.getElementById("deviceId").value.trim();
-
-        const passwordValue =
-            document.getElementById("password").value;
-
-
-        if (
-            !nameValue ||
-            !phoneValue ||
-            !emailValue ||
-            !passwordValue
-        ) {
-
-            message.textContent =
-                "Please fill all required fields.";
-
-            return;
-        }
-
-
-        const result =
-            await createUserWithEmailAndPassword(
-                auth,
-                emailValue,
-                passwordValue
-            );
-
-
-        const response =
-            await fetch(
-                "/register",
-                {
-
-                    method: "POST",
-
-                    headers:
-                        await getHeaders(),
-
-                    body:
-                        JSON.stringify({
-
-                            name: nameValue,
-
-                            phone: phoneValue,
-
-                            email: emailValue,
-
-                            location:
-                                locationValue,
-
-                            device_id:
-                                deviceValue
-                        })
-                }
-            );
-
-
-        const data =
-            await response.json();
-
-
-        if (!response.ok) {
-
-            throw new Error(
-                data.message ||
-                "Could not save profile."
-            );
-        }
-
-
-        localStorage.setItem(
-            "smart_fire_logged_in",
-            "true"
+                body:
+                    JSON.stringify(data)
+            }
         );
 
 
+    const result =
+        await response.json();
+
+
+    document.getElementById(
+        "message"
+    ).textContent =
+        result.message;
+
+
+    if (result.success) {
+
         window.location.href =
             "/dashboard";
-
     }
-
-    catch (error) {
-
-        message.textContent =
-            error.message;
-    }
-};
+}
 
 
-window.loginUser = async function() {
+async function loginUser() {
 
-    try {
+    const data = {
 
-        const emailValue =
+        email:
             document.getElementById(
                 "loginEmail"
-            ).value.trim();
+            ).value,
 
-        const passwordValue =
+        password:
             document.getElementById(
                 "loginPassword"
-            ).value;
+            ).value
+    };
 
 
-        await signInWithEmailAndPassword(
-            auth,
-            emailValue,
-            passwordValue
+    const response =
+        await fetch(
+            "/login",
+            {
+
+                method: "POST",
+
+                headers: {
+                    "Content-Type":
+                        "application/json"
+                },
+
+                body:
+                    JSON.stringify(data)
+            }
         );
 
 
-        localStorage.setItem(
-            "smart_fire_logged_in",
-            "true"
-        );
+    const result =
+        await response.json();
 
+
+    document.getElementById(
+        "message"
+    ).textContent =
+        result.message;
+
+
+    if (result.success) {
 
         window.location.href =
             "/dashboard";
-
     }
-
-    catch (error) {
-
-        message.textContent =
-            error.message;
-    }
-};
-
-
-/*
- Firebase Authentication keeps the login session.
- If the user is already logged in,
- send them directly to Dashboard.
-*/
-
-onAuthStateChanged(
-    auth,
-    function(user) {
-
-        if (
-            user &&
-            localStorage.getItem(
-                "smart_fire_logged_in"
-            ) === "true"
-        ) {
-
-            window.location.href =
-                "/dashboard";
-        }
-    }
-);
+}
 
 </script>
 
 </body>
 
 </html>
-""".replace(
-    "__FIREBASE_CONFIG__",
-    json.dumps(FIREBASE_CONFIG)
-)
+
+"""
 
 
 # ============================================================
@@ -720,15 +653,11 @@ DASHBOARD_HTML = """
 <head>
 
 <meta name="viewport"
-      content="width=device-width, initial-scale=1">
+content="width=device-width, initial-scale=1">
 
-<title>Smart Fire Guard Dashboard</title>
+<title>Smart Fire Guard</title>
 
 <style>
-
-* {
-    box-sizing: border-box;
-}
 
 body {
 
@@ -738,7 +667,7 @@ body {
 
     color: white;
 
-    font-family: Arial, sans-serif;
+    font-family: Arial;
 }
 
 header {
@@ -777,7 +706,10 @@ main {
     display: grid;
 
     grid-template-columns:
-        repeat(auto-fit, minmax(210px, 1fr));
+    repeat(
+        auto-fit,
+        minmax(200px, 1fr)
+    );
 
     gap: 15px;
 }
@@ -807,15 +739,13 @@ button {
 
     border: 0;
 
-    border-radius: 9px;
+    border-radius: 8px;
 
     background: #e63946;
 
     color: white;
 
     font-weight: bold;
-
-    cursor: pointer;
 }
 
 .gray {
@@ -830,9 +760,11 @@ input {
 
     margin: 5px 0;
 
+    box-sizing: border-box;
+
     border: 0;
 
-    border-radius: 9px;
+    border-radius: 8px;
 }
 
 .hidden {
@@ -853,8 +785,8 @@ input {
 </strong>
 
 <button
-    class="gray"
-    onclick="logout()"
+class="gray"
+onclick="logout()"
 >
 Logout
 </button>
@@ -865,29 +797,31 @@ Logout
 <main>
 
 
-<!-- USER -->
-
 <div class="card">
 
 <h2>
 Welcome,
-<span id="ownerName">User</span>
+<span id="userName">
+User
+</span>
 </h2>
 
 <p>
-Registered phone:
-<span id="ownerPhone">-</span>
+Phone:
+<span id="userPhone">
+-
+</span>
 </p>
 
 <button
-    class="gray"
-    onclick="toggleProfile()"
+onclick="toggleProfile()"
+class="gray"
 >
 My Profile
 </button>
 
 <button
-    onclick="enableNotifications()"
+onclick="enableNotifications()"
 >
 Enable Notifications
 </button>
@@ -895,40 +829,36 @@ Enable Notifications
 </div>
 
 
-<!-- PROFILE -->
-
 <div
-    id="profileBox"
-    class="card hidden"
+id="profile"
+class="card hidden"
 >
 
-<h2>
-My Profile
-</h2>
+<h2>My Profile</h2>
 
 <input
-    id="profileName"
-    placeholder="Name"
->
-
-<input
-    id="profilePhone"
-    placeholder="Phone"
+id="pName"
+placeholder="Name"
 >
 
 <input
-    id="profileEmail"
-    placeholder="Email"
+id="pPhone"
+placeholder="Phone"
 >
 
 <input
-    id="profileLocation"
-    placeholder="Location"
+id="pEmail"
+placeholder="Email"
 >
 
 <input
-    id="profileDevice"
-    placeholder="Device ID"
+id="pLocation"
+placeholder="Location"
+>
+
+<input
+id="pDevice"
+placeholder="Device ID"
 >
 
 <button onclick="saveProfile()">
@@ -940,8 +870,6 @@ Save Profile
 </div>
 
 
-<!-- STATUS -->
-
 <div class="grid">
 
 
@@ -950,8 +878,8 @@ Save Profile
 System
 
 <div
-    id="system"
-    class="value safe"
+id="system"
+class="value safe"
 >
 SAFE
 </div>
@@ -964,8 +892,8 @@ SAFE
 IR Sensor
 
 <div
-    id="flame"
-    class="value"
+id="flame"
+class="value"
 >
 SAFE
 </div>
@@ -978,8 +906,8 @@ SAFE
 Temperature
 
 <div
-    id="temperature"
-    class="value"
+id="temperature"
+class="value"
 >
 0 °C
 </div>
@@ -992,8 +920,8 @@ Temperature
 Relay / Pump
 
 <div
-    id="relay"
-    class="value"
+id="relay"
+class="value"
 >
 OFF
 </div>
@@ -1006,8 +934,8 @@ OFF
 Notification
 
 <div
-    id="notification"
-    class="value"
+id="notification"
+class="value"
 >
 OFF
 </div>
@@ -1015,70 +943,25 @@ OFF
 </div>
 
 
-<div class="card">
-
-Registered Phones
-
-<div
-    id="phoneCount"
-    class="value"
->
-0
 </div>
 
-</div>
-
-
-</div>
-
-
-<!-- TEST -->
 
 <div class="card">
 
-<h2>
-System Test
-</h2>
+<h2>System Test</h2>
 
 <button onclick="testFire()">
 TEST FIRE
 </button>
 
 <button
-    class="gray"
-    onclick="resetSystem()"
+class="gray"
+onclick="resetSystem()"
 >
 RESET
 </button>
 
 <p id="result"></p>
-
-</div>
-
-
-<!-- ESP8266 -->
-
-<div class="card">
-
-<h2>
-ESP8266 Device
-</h2>
-
-<p>
-
-Your registered Device ID is used to connect
-the NodeMCU to your account.
-
-</p>
-
-<p>
-
-When the ESP8266 sends a fire event,
-the server finds the owner of that Device ID
-and sends the Firebase notification only to
-that owner's registered phone.
-
-</p>
 
 </div>
 
@@ -1096,15 +979,6 @@ from
 
 
 import {
-    getAuth,
-    onAuthStateChanged,
-    signOut
-}
-from
-"https://www.gstatic.com/firebasejs/12.19.0/firebase-auth.js";
-
-
-import {
     getMessaging,
     getToken,
     onMessage
@@ -1118,78 +992,22 @@ const firebaseConfig =
 
 
 const firebaseApp =
-    initializeApp(firebaseConfig);
-
-
-const auth =
-    getAuth(firebaseApp);
+    initializeApp(
+        firebaseConfig
+    );
 
 
 const messaging =
-    getMessaging(firebaseApp);
-
-
-let currentUser = null;
-
-
-async function headers() {
-
-    const token =
-        await currentUser.getIdToken();
-
-    return {
-
-        "Authorization":
-            "Bearer " + token,
-
-        "Content-Type":
-            "application/json"
-    };
-}
-
-
-onAuthStateChanged(
-    auth,
-    async function(user) {
-
-        if (!user) {
-
-            localStorage.removeItem(
-                "smart_fire_logged_in"
-            );
-
-            window.location.href = "/";
-
-            return;
-        }
-
-
-        currentUser = user;
-
-
-        localStorage.setItem(
-            "smart_fire_logged_in",
-            "true"
-        );
-
-
-        await loadProfile();
-
-        await updateStatus();
-
-    }
-);
+    getMessaging(
+        firebaseApp
+    );
 
 
 async function loadProfile() {
 
     const response =
         await fetch(
-            "/profile",
-            {
-                headers:
-                    await headers()
-            }
+            "/profile"
         );
 
 
@@ -1198,6 +1016,10 @@ async function loadProfile() {
 
 
     if (!data.success) {
+
+        window.location.href =
+            "/";
+
         return;
     }
 
@@ -1206,44 +1028,81 @@ async function loadProfile() {
         data.user;
 
 
-    ownerName.textContent =
-        user.name || currentUser.email;
+    document.getElementById(
+        "userName"
+    ).textContent =
+        user.name;
 
 
-    ownerPhone.textContent =
-        user.phone || "-";
+    document.getElementById(
+        "userPhone"
+    ).textContent =
+        user.phone;
 
 
-    profileName.value =
-        user.name || "";
+    document.getElementById(
+        "pName"
+    ).value =
+        user.name;
 
 
-    profilePhone.value =
-        user.phone || "";
+    document.getElementById(
+        "pPhone"
+    ).value =
+        user.phone;
 
 
-    profileEmail.value =
-        user.email || currentUser.email || "";
+    document.getElementById(
+        "pEmail"
+    ).value =
+        user.email;
 
 
-    profileLocation.value =
-        user.location || "";
+    document.getElementById(
+        "pLocation"
+    ).value =
+        user.location;
 
 
-    profileDevice.value =
-        user.device_id || "";
+    document.getElementById(
+        "pDevice"
+    ).value =
+        user.device_id;
 }
 
 
-window.toggleProfile = function() {
+window.toggleProfile =
+function() {
 
-    profileBox.classList.toggle(
+    document.getElementById(
+        "profile"
+    ).classList.toggle(
         "hidden"
     );
 };
 
 
-window.saveProfile = async function() {
+window.saveProfile =
+async function() {
+
+    const data = {
+
+        name:
+            pName.value,
+
+        phone:
+            pPhone.value,
+
+        email:
+            pEmail.value,
+
+        location:
+            pLocation.value,
+
+        device_id:
+            pDevice.value
+    };
+
 
     const response =
         await fetch(
@@ -1252,65 +1111,45 @@ window.saveProfile = async function() {
 
                 method: "POST",
 
-                headers:
-                    await headers(),
+                headers: {
+                    "Content-Type":
+                        "application/json"
+                },
 
                 body:
-                    JSON.stringify({
-
-                        name:
-                            profileName.value.trim(),
-
-                        phone:
-                            profilePhone.value.trim(),
-
-                        email:
-                            profileEmail.value.trim(),
-
-                        location:
-                            profileLocation.value.trim(),
-
-                        device_id:
-                            profileDevice.value.trim()
-                    })
+                    JSON.stringify(data)
             }
         );
 
 
-    const data =
+    const result =
         await response.json();
 
 
     profileMessage.textContent =
-        data.message;
+        result.message;
 
 
-    await loadProfile();
+    loadProfile();
 };
 
 
-window.enableNotifications = async function() {
+window.enableNotifications =
+async function() {
 
     try {
-
-        if (!("Notification" in window)) {
-
-            alert(
-                "This browser does not support notifications."
-            );
-
-            return;
-        }
-
 
         const permission =
             await Notification.requestPermission();
 
 
-        if (permission !== "granted") {
+        if (
+            permission !==
+            "granted"
+        ) {
 
             alert(
-                "Notification permission was not granted."
+                "Notification permission denied."
             );
 
             return;
@@ -1318,7 +1157,9 @@ window.enableNotifications = async function() {
 
 
         const registration =
-            await navigator.serviceWorker.register(
+            await navigator
+            .serviceWorker
+            .register(
                 "/firebase-messaging-sw.js"
             );
 
@@ -1340,20 +1181,22 @@ window.enableNotifications = async function() {
         if (!token) {
 
             throw new Error(
-                "Firebase did not return a notification token."
+                "FCM token was not created."
             );
         }
 
 
         const response =
             await fetch(
-                "/save-fcm-token",
+                "/save-token",
                 {
 
                     method: "POST",
 
-                    headers:
-                        await headers(),
+                    headers: {
+                        "Content-Type":
+                            "application/json"
+                    },
 
                     body:
                         JSON.stringify({
@@ -1363,20 +1206,20 @@ window.enableNotifications = async function() {
             );
 
 
-        const data =
+        const result =
             await response.json();
 
 
         alert(
-            data.message
+            result.message
         );
 
 
-        await updateStatus();
+        updateStatus();
 
     }
 
-    catch (error) {
+    catch(error) {
 
         alert(
             "Notification error: " +
@@ -1390,42 +1233,27 @@ onMessage(
     messaging,
     function(payload) {
 
-        if (
-            Notification.permission ===
-            "granted"
-        ) {
+        new Notification(
 
-            new Notification(
+            payload.notification?.title ||
+            "SMART FIRE GUARD",
 
-                payload.notification?.title ||
-                "SMART FIRE GUARD",
+            {
 
-                {
-
-                    body:
-                        payload.notification?.body ||
-                        "FIRE DETECTED!"
-                }
-            );
-        }
+                body:
+                    payload.notification?.body ||
+                    "FIRE DETECTED!"
+            }
+        );
     }
 );
 
 
 async function updateStatus() {
 
-    if (!currentUser) {
-        return;
-    }
-
-
     const response =
         await fetch(
-            "/status",
-            {
-                headers:
-                    await headers()
-            }
+            "/status"
         );
 
 
@@ -1440,17 +1268,14 @@ async function updateStatus() {
 
     system.textContent =
         data.fire
-            ? "FIRE DETECTED"
-            : "SAFE";
+        ? "FIRE DETECTED"
+        : "SAFE";
 
 
     system.className =
-        "value " +
-        (
-            data.fire
-                ? "danger"
-                : "safe"
-        );
+        data.fire
+        ? "value danger"
+        : "value safe";
 
 
     flame.textContent =
@@ -1467,27 +1292,20 @@ async function updateStatus() {
 
 
     notification.textContent =
-        data.registered_tokens > 0
-            ? "ENABLED"
-            : "OFF";
-
-
-    phoneCount.textContent =
-        data.registered_tokens;
+        data.notification
+        ? "ENABLED"
+        : "OFF";
 }
 
 
-window.testFire = async function() {
+window.testFire =
+async function() {
 
     const response =
         await fetch(
             "/api/test-fire",
             {
-
-                method: "POST",
-
-                headers:
-                    await headers()
+                method: "POST"
             }
         );
 
@@ -1500,21 +1318,18 @@ window.testFire = async function() {
         data.message;
 
 
-    await updateStatus();
+    updateStatus();
 };
 
 
-window.resetSystem = async function() {
+window.resetSystem =
+async function() {
 
     const response =
         await fetch(
             "/api/reset",
             {
-
-                method: "POST",
-
-                headers:
-                    await headers()
+                method: "POST"
             }
         );
 
@@ -1527,21 +1342,25 @@ window.resetSystem = async function() {
         data.message;
 
 
-    await updateStatus();
+    updateStatus();
 };
 
 
-window.logout = async function() {
+window.logout =
+async function() {
 
-    await signOut(auth);
-
-    localStorage.removeItem(
-        "smart_fire_logged_in"
+    await fetch(
+        "/logout"
     );
 
-    window.location.href = "/";
+    window.location.href =
+        "/";
 };
 
+
+loadProfile();
+
+updateStatus();
 
 setInterval(
     updateStatus,
@@ -1556,7 +1375,9 @@ setInterval(
 
 """.replace(
     "__FIREBASE_CONFIG__",
-    json.dumps(FIREBASE_CONFIG)
+    __import__("json").dumps(
+        FIREBASE_CONFIG
+    )
 ).replace(
     "__VAPID_KEY__",
     VAPID_KEY
@@ -1570,6 +1391,13 @@ setInterval(
 @app.route("/")
 def home():
 
+    # If already logged in,
+    # go directly to dashboard.
+
+    if session.get("user_id") in users:
+
+        return dashboard()
+
     return render_template_string(
         AUTH_HTML
     )
@@ -1578,13 +1406,19 @@ def home():
 @app.route("/dashboard")
 def dashboard():
 
+    if session.get("user_id") not in users:
+
+        return render_template_string(
+            AUTH_HTML
+        )
+
     return render_template_string(
         DASHBOARD_HTML
     )
 
 
 # ============================================================
-# REGISTER USER
+# REGISTER
 # ============================================================
 
 @app.route(
@@ -1593,22 +1427,9 @@ def dashboard():
 )
 def register():
 
-    user = get_logged_in_user()
-
-    if not user:
-
-        return jsonify(
-            success=False,
-            message="Login required."
-        ), 401
-
-
     data = request.get_json(
         silent=True
     ) or {}
-
-
-    uid = user["uid"]
 
 
     name = data.get(
@@ -1641,58 +1462,158 @@ def register():
     ).strip()
 
 
-    if not name or not phone:
-
-        return jsonify(
-            success=False,
-            message="Name and phone are required."
-        ), 400
-
-
-    save_user(
-        uid,
-        {
-
-            "name": name,
-
-            "phone": phone,
-
-            "email": email,
-
-            "location": location,
-
-            "device_id": device_id
-        }
+    password = data.get(
+        "password",
+        ""
     )
 
 
-    # Connect Device ID to this Firebase user.
-    if device_id:
+    if not name:
 
-        db.collection(
-            "devices"
-        ).document(
-            device_id
-        ).set(
-
-            {
-
-                "owner_id": uid,
-
-                "device_id": device_id,
-
-                "name":
-                    "Smart Fire Guard"
-
-            },
-
-            merge=True
+        return jsonify(
+            success=False,
+            message="Enter your name."
         )
 
 
+    if not phone:
+
+        return jsonify(
+            success=False,
+            message="Enter your phone number."
+        )
+
+
+    if not email:
+
+        return jsonify(
+            success=False,
+            message="Enter your email."
+        )
+
+
+    if not password:
+
+        return jsonify(
+            success=False,
+            message="Enter a password."
+        )
+
+
+    existing_id, existing_user = (
+        find_user_by_email(email)
+    )
+
+
+    if existing_user:
+
+        return jsonify(
+            success=False,
+            message="Email already registered. Please login."
+        )
+
+
+    user_id = secrets.token_hex(16)
+
+
+    users[user_id] = {
+
+        "name": name,
+
+        "phone": phone,
+
+        "email": email,
+
+        "location": location,
+
+        "device_id": device_id,
+
+        "password":
+            hash_password(password),
+
+        "fcm_tokens": []
+    }
+
+
+    session["user_id"] =
+        user_id
+
+
     return jsonify(
+
         success=True,
-        message="Registration saved successfully."
+
+        message=
+            "Registration successful."
+    )
+
+
+# ============================================================
+# LOGIN
+# ============================================================
+
+@app.route(
+    "/login",
+    methods=["POST"]
+)
+def login():
+
+    data = request.get_json(
+        silent=True
+    ) or {}
+
+
+    email = data.get(
+        "email",
+        ""
+    ).strip()
+
+
+    password = data.get(
+        "password",
+        ""
+    )
+
+
+    user_id, user = (
+        find_user_by_email(email)
+    )
+
+
+    if not user:
+
+        return jsonify(
+
+            success=False,
+
+            message=
+                "User not found. Please register."
+        )
+
+
+    if user["password"] != hash_password(
+        password
+    ):
+
+        return jsonify(
+
+            success=False,
+
+            message=
+                "Incorrect password."
+        )
+
+
+    session["user_id"] =
+        user_id
+
+
+    return jsonify(
+
+        success=True,
+
+        message=
+            "Login successful."
     )
 
 
@@ -1706,24 +1627,44 @@ def register():
 )
 def profile():
 
-    user = get_logged_in_user()
+    user_id, user = (
+        current_user()
+    )
+
 
     if not user:
 
         return jsonify(
-            success=False,
-            message="Login required."
+            success=False
         ), 401
-
-
-    uid = user["uid"]
 
 
     if request.method == "GET":
 
+        safe_user = {
+
+            "name":
+                user["name"],
+
+            "phone":
+                user["phone"],
+
+            "email":
+                user["email"],
+
+            "location":
+                user["location"],
+
+            "device_id":
+                user["device_id"]
+        }
+
+
         return jsonify(
+
             success=True,
-            user=get_user(uid)
+
+            user=safe_user
         )
 
 
@@ -1732,93 +1673,74 @@ def profile():
     ) or {}
 
 
-    device_id = data.get(
-        "device_id",
-        ""
-    ).strip()
+    old_device =
+        user["device_id"]
 
 
-    save_user(
-        uid,
-        {
-
-            "name":
-                data.get(
-                    "name",
-                    ""
-                ).strip(),
-
-            "phone":
-                data.get(
-                    "phone",
-                    ""
-                ).strip(),
-
-            "email":
-                data.get(
-                    "email",
-                    ""
-                ).strip(),
-
-            "location":
-                data.get(
-                    "location",
-                    ""
-                ).strip(),
-
-            "device_id":
-                device_id
-        }
-    )
+    user["name"] =
+        data.get(
+            "name",
+            user["name"]
+        ).strip()
 
 
-    if device_id:
+    user["phone"] =
+        data.get(
+            "phone",
+            user["phone"]
+        ).strip()
 
-        db.collection(
-            "devices"
-        ).document(
-            device_id
-        ).set(
 
-            {
+    user["email"] =
+        data.get(
+            "email",
+            user["email"]
+        ).strip()
 
-                "owner_id": uid,
 
-                "device_id":
-                    device_id,
+    user["location"] =
+        data.get(
+            "location",
+            user["location"]
+        ).strip()
 
-                "name":
-                    "Smart Fire Guard"
 
-            },
-
-            merge=True
-        )
+    user["device_id"] =
+        data.get(
+            "device_id",
+            user["device_id"]
+        ).strip()
 
 
     return jsonify(
+
         success=True,
-        message="Profile updated successfully."
+
+        message=
+            "Profile updated."
     )
 
 
 # ============================================================
-# SAVE THIS PHONE'S FCM TOKEN
+# SAVE FCM TOKEN
 # ============================================================
 
 @app.route(
-    "/save-fcm-token",
+    "/save-token",
     methods=["POST"]
 )
-def save_fcm_token():
+def save_token():
 
-    user = get_logged_in_user()
+    user_id, user = (
+        current_user()
+    )
+
 
     if not user:
 
         return jsonify(
             success=False,
-            message="Login required."
+            message="Please login."
         ), 401
 
 
@@ -1836,42 +1758,29 @@ def save_fcm_token():
     if not token:
 
         return jsonify(
+
             success=False,
-            message="FCM token is missing."
-        ), 400
+
+            message=
+                "Notification token missing."
+        )
 
 
-    # IMPORTANT:
-    # The token is connected to the currently
-    # authenticated Firebase user.
-    db.collection(
+    if token not in user[
         "fcm_tokens"
-    ).document(
-        token
-    ).set(
+    ]:
 
-        {
-
-            "uid":
-                user["uid"],
-
-            "email":
-                user.get(
-                    "email",
-                    ""
-                )
-        },
-
-        merge=True
-    )
+        user[
+            "fcm_tokens"
+        ].append(token)
 
 
     return jsonify(
+
         success=True,
-        message=(
-            "This phone is now registered "
-            "for fire notifications."
-        )
+
+        message=
+            "This phone is registered for fire notifications."
     )
 
 
@@ -1879,34 +1788,13 @@ def save_fcm_token():
 # STATUS
 # ============================================================
 
-fire_status = {}
-
-
-def user_status(uid):
-
-    if uid not in fire_status:
-
-        fire_status[uid] = {
-
-            "fire": False,
-
-            "flame": "SAFE",
-
-            "temperature": 0,
-
-            "extinguisher": "OFF",
-
-            "notification_sent": False
-        }
-
-
-    return fire_status[uid]
-
-
 @app.route("/status")
 def status():
 
-    user = get_logged_in_user()
+    user_id, user = (
+        current_user()
+    )
+
 
     if not user:
 
@@ -1915,31 +1803,26 @@ def status():
         ), 401
 
 
-    uid = user["uid"]
-
-    current = user_status(uid)
-
-
     return jsonify(
 
         success=True,
 
-        fire=current["fire"],
+        fire=
+            fire_status["fire"],
 
-        flame=current["flame"],
+        flame=
+            fire_status["flame"],
 
-        temperature=current["temperature"],
+        temperature=
+            fire_status["temperature"],
 
         extinguisher=
-            current["extinguisher"],
+            fire_status["extinguisher"],
 
-        notification_sent=
-            current["notification_sent"],
-
-        registered_tokens=
+        notification=
             len(
-                get_user_tokens(uid)
-            )
+                user["fcm_tokens"]
+            ) > 0
     )
 
 
@@ -1972,43 +1855,7 @@ def esp_fire():
 
             message=
                 "device_id is required."
-
         ), 400
-
-
-    if not db:
-
-        return jsonify(
-
-            success=False,
-
-            message=
-                "Firebase is not configured."
-
-        ), 500
-
-
-    # Find which Firebase user owns this device.
-    device = get_device(
-        device_id
-    )
-
-
-    uid = device.get(
-        "owner_id"
-    )
-
-
-    if not uid:
-
-        return jsonify(
-
-            success=False,
-
-            message=
-                "This ESP8266 device is not registered."
-
-        ), 404
 
 
     fire = bool(
@@ -2019,67 +1866,80 @@ def esp_fire():
     )
 
 
-    flame = data.get(
-        "flame",
-        "DETECTED"
-    )
-
-
     temperature = data.get(
         "temperature",
         0
     )
 
 
-    current = user_status(
-        uid
-    )
+    # Find the user who registered this device.
+    owner_id = None
+    owner = None
 
 
-    current["temperature"] = (
-        temperature
-    )
+    for uid, user in users.items():
+
+        if (
+            user["device_id"]
+            == device_id
+        ):
+
+            owner_id = uid
+
+            owner = user
+
+            break
+
+
+    if not owner:
+
+        return jsonify(
+
+            success=False,
+
+            message=
+                "Device is not registered."
+        ), 404
+
+
+    fire_status[
+        "temperature"
+    ] = temperature
 
 
     if fire:
 
-        current["fire"] = True
-
-        current["flame"] = (
-            "DETECTED"
-        )
-
-        current["extinguisher"] = (
-            "ACTIVATED"
-        )
+        fire_status[
+            "fire"
+        ] = True
 
 
-        # Send only once for this fire event.
-        if not current[
+        fire_status[
+            "flame"
+        ] = "DETECTED"
+
+
+        fire_status[
+            "extinguisher"
+        ] = "ACTIVATED"
+
+
+        # Send only once until reset.
+        if not fire_status[
             "notification_sent"
         ]:
 
-            owner = get_user(
-                uid
-            )
+            sent = send_notification(
 
+                owner,
 
-            sent = send_fire_notification(
-
-                uid,
-
-                temperature,
-
-                owner.get(
-                    "location",
-                    ""
-                )
+                temperature
             )
 
 
             if sent:
 
-                current[
+                fire_status[
                     "notification_sent"
                 ] = True
 
@@ -2090,20 +1950,24 @@ def esp_fire():
 
             fire=True,
 
-            message=(
-                "Fire detected. "
-                "Alert sent to the "
-                "registered user's phone."
-            )
+            message=
+                "Fire detected."
         )
 
 
-    # No fire.
-    current["fire"] = False
+    fire_status[
+        "fire"
+    ] = False
 
-    current["flame"] = flame
 
-    current["extinguisher"] = "OFF"
+    fire_status[
+        "flame"
+    ] = "SAFE"
+
+
+    fire_status[
+        "extinguisher"
+    ] = "OFF"
 
 
     return jsonify(
@@ -2112,12 +1976,13 @@ def esp_fire():
 
         fire=False,
 
-        message="System is safe."
+        message=
+            "System is safe."
     )
 
 
 # ============================================================
-# TEST FIRE FROM DASHBOARD
+# TEST FIRE
 # ============================================================
 
 @app.route(
@@ -2126,61 +1991,54 @@ def esp_fire():
 )
 def test_fire():
 
-    user = get_logged_in_user()
+    user_id, user = (
+        current_user()
+    )
+
 
     if not user:
 
         return jsonify(
             success=False,
-            message="Login required."
+            message="Please login."
         ), 401
 
 
-    uid = user["uid"]
-
-    current = user_status(
-        uid
-    )
+    fire_status[
+        "fire"
+    ] = True
 
 
-    current["fire"] = True
-
-    current["flame"] = (
-        "DETECTED"
-    )
-
-    current["temperature"] = 82
-
-    current["extinguisher"] = (
-        "ACTIVATED"
-    )
+    fire_status[
+        "flame"
+    ] = "DETECTED"
 
 
-    if not current[
+    fire_status[
+        "temperature"
+    ] = 82
+
+
+    fire_status[
+        "extinguisher"
+    ] = "ACTIVATED"
+
+
+    if not fire_status[
         "notification_sent"
     ]:
 
-        owner = get_user(
-            uid
-        )
+        sent = send_notification(
 
+            user,
 
-        sent = send_fire_notification(
-
-            uid,
-
-            82,
-
-            owner.get(
-                "location",
-                ""
-            )
+            82
         )
 
 
         if sent:
 
-            current[
+            fire_status[
                 "notification_sent"
             ] = True
 
@@ -2204,31 +2062,41 @@ def test_fire():
 )
 def reset():
 
-    user = get_logged_in_user()
+    user_id, user = (
+        current_user()
+    )
+
 
     if not user:
 
         return jsonify(
-            success=False,
-            message="Login required."
+            success=False
         ), 401
 
 
-    uid = user["uid"]
+    fire_status[
+        "fire"
+    ] = False
 
 
-    fire_status[uid] = {
+    fire_status[
+        "flame"
+    ] = "SAFE"
 
-        "fire": False,
 
-        "flame": "SAFE",
+    fire_status[
+        "temperature"
+    ] = 0
 
-        "temperature": 0,
 
-        "extinguisher": "OFF",
+    fire_status[
+        "extinguisher"
+    ] = "OFF"
 
-        "notification_sent": False
-    }
+
+    fire_status[
+        "notification_sent"
+    ] = False
 
 
     return jsonify(
@@ -2236,12 +2104,26 @@ def reset():
         success=True,
 
         message=
-            "System reset successfully."
+            "System reset."
     )
 
 
 # ============================================================
-# HEALTH CHECK
+# LOGOUT
+# ============================================================
+
+@app.route("/logout")
+def logout():
+
+    session.clear()
+
+    return jsonify(
+        success=True
+    )
+
+
+# ============================================================
+# HEALTH
 # ============================================================
 
 @app.route("/health")
@@ -2251,8 +2133,9 @@ def health():
 
         status="ok",
 
-        firebase=
-            bool(db)
+        users=len(users),
+
+        firebase=firebase_ready
     )
 
 
