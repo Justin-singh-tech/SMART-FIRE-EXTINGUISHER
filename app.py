@@ -1,59 +1,77 @@
 import os
+import json
 import sqlite3
-import hashlib
-import secrets
-from functools import wraps
-from datetime import datetime, timezone
+from datetime import datetime
 
-from flask import Flask, request, jsonify, session, render_template_string
+from flask import (
+    Flask,
+    request,
+    jsonify,
+    render_template_string,
+    redirect,
+    url_for,
+    session
+)
+from pywebpush import webpush, WebPushException
+
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("FLASK_SECRET_KEY", secrets.token_hex(32))
-DB_PATH = os.environ.get("DATABASE_PATH", "smart_fire_guard.db")
 
-# ============================================================
+# ---------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------
+
+app.secret_key = os.environ.get(
+    "SECRET_KEY",
+    "smart-fire-guard-secret-change-this"
+)
+
+DATABASE = "smart_fire_guard.db"
+
+VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
+VAPID_PUBLIC_KEY = os.environ.get("VAPID_PUBLIC_KEY", "")
+VAPID_EMAIL = os.environ.get(
+    "VAPID_EMAIL",
+    "mailto:admin@example.com"
+)
+
+
+# ---------------------------------------------------------
 # DATABASE
-# ============================================================
+# ---------------------------------------------------------
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DATABASE)
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def init_db():
     conn = get_db()
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS owners (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
-            phone TEXT NOT NULL,
-            email TEXT NOT NULL UNIQUE,
-            password_hash TEXT NOT NULL,
-            device_id TEXT NOT NULL UNIQUE,
-            address TEXT DEFAULT '',
-            created_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS maintenance (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            message TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS fire_alerts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
+            phone TEXT,
+            email TEXT,
+            location TEXT,
             device_id TEXT,
-            latitude REAL,
-            longitude REAL,
-            accuracy REAL DEFAULT 0,
-            temperature REAL DEFAULT 0,
-            source TEXT DEFAULT 'website',
             created_at TEXT NOT NULL
-        );
+        )
     """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS push_subscriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id INTEGER NOT NULL,
+            endpoint TEXT UNIQUE NOT NULL,
+            subscription_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(owner_id) REFERENCES owners(id)
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -61,1609 +79,1789 @@ def init_db():
 init_db()
 
 
-def utc_now():
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+# ---------------------------------------------------------
+# FIRE STATUS
+# ---------------------------------------------------------
+
+fire_status = {
+    "fire": False,
+    "flame": "SAFE",
+    "temperature": 0,
+    "extinguisher": "OFF",
+    "notification_sent": False
+}
 
 
-def hash_password(password):
-    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+# ---------------------------------------------------------
+# PUSH NOTIFICATION
+# ---------------------------------------------------------
+
+def send_push_notification(owner_id):
+    """
+    Send Web Push notification to all subscriptions
+    belonging to one registered owner.
+    """
+
+    if not VAPID_PRIVATE_KEY:
+        print("VAPID_PRIVATE_KEY is missing.")
+        return False
+
+    conn = get_db()
+
+    subscriptions = conn.execute(
+        """
+        SELECT id, endpoint, subscription_json
+        FROM push_subscriptions
+        WHERE owner_id = ?
+        """,
+        (owner_id,)
+    ).fetchall()
+
+    success = False
+
+    payload = {
+        "title": "SMART FIRE GUARD",
+        "body": (
+            "🔥 FIRE DETECTED! "
+            "Please check the location immediately."
+        ),
+        "icon": "/static/fire-icon.png",
+        "badge": "/static/fire-badge.png",
+        "data": {
+            "type": "fire_alert",
+            "temperature": str(fire_status["temperature"]),
+            "location": get_owner_location(owner_id),
+            "url": "/dashboard"
+        }
+    }
+
+    for subscription in subscriptions:
+
+        try:
+            subscription_info = json.loads(
+                subscription["subscription_json"]
+            )
+
+            webpush(
+                subscription_info=subscription_info,
+                data=json.dumps(payload),
+                vapid_private_key=VAPID_PRIVATE_KEY,
+                vapid_claims={
+                    "sub": VAPID_EMAIL
+                }
+            )
+
+            print(
+                "Web Push notification sent:",
+                subscription["endpoint"]
+            )
+
+            success = True
+
+        except WebPushException as e:
+
+            print("Web Push error:", e)
+
+            # Remove expired/invalid subscriptions
+            if getattr(e, "response", None) is not None:
+
+                try:
+                    status_code = e.response.status_code
+
+                    if status_code in [404, 410]:
+                        conn.execute(
+                            """
+                            DELETE FROM push_subscriptions
+                            WHERE id = ?
+                            """,
+                            (subscription["id"],)
+                        )
+
+                except Exception:
+                    pass
+
+        except Exception as e:
+            print("Notification error:", e)
+
+    conn.commit()
+    conn.close()
+
+    return success
 
 
-def get_current_user():
-    user_id = session.get("user_id")
-    if not user_id:
+def get_owner_location(owner_id):
+    conn = get_db()
+
+    owner = conn.execute(
+        "SELECT location FROM owners WHERE id = ?",
+        (owner_id,)
+    ).fetchone()
+
+    conn.close()
+
+    if owner:
+        return owner["location"] or "Registered location"
+
+    return "Registered location"
+
+
+# ---------------------------------------------------------
+# OWNER HELPERS
+# ---------------------------------------------------------
+
+def get_current_owner():
+    owner_id = session.get("owner_id")
+
+    if not owner_id:
         return None
 
     conn = get_db()
-    user = conn.execute(
-        "SELECT * FROM users WHERE id = ?", (user_id,)
+
+    owner = conn.execute(
+        "SELECT * FROM owners WHERE id = ?",
+        (owner_id,)
     ).fetchone()
+
     conn.close()
-    return user
+
+    return owner
 
 
-def login_required(func):
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        if not get_current_user():
-            return jsonify({"ok": False, "error": "Please login first."}), 401
-        return func(*args, **kwargs)
-    return wrapper
+# ---------------------------------------------------------
+# SERVICE WORKER
+# ---------------------------------------------------------
+
+SERVICE_WORKER = """
+const CACHE_NAME = "smart-fire-guard-v1";
+
+self.addEventListener("install", event => {
+    self.skipWaiting();
+});
+
+self.addEventListener("activate", event => {
+    event.waitUntil(self.clients.claim());
+});
 
 
-# Browser IDs currently polling the server.
-# No Firebase or third-party notification service is used.
-open_browsers = set()
+self.addEventListener("push", event => {
+
+    let data = {
+        title: "SMART FIRE GUARD",
+        body: "🔥 FIRE DETECTED!",
+        icon: "/static/fire-icon.png",
+        badge: "/static/fire-badge.png",
+        data: {
+            url: "/dashboard"
+        }
+    };
+
+    try {
+        if (event.data) {
+            data = event.data.json();
+        }
+    } catch (error) {
+        console.log("Push data error:", error);
+    }
 
 
-# ============================================================
-# MODERN FIRE-THEME SINGLE-PAGE WEBSITE
-# ============================================================
+    const options = {
+        body: data.body,
 
-PAGE = r"""
+        icon: data.icon || "/static/fire-icon.png",
+
+        badge: data.badge || "/static/fire-badge.png",
+
+        tag: "smart-fire-alert",
+
+        renotify: true,
+
+        requireInteraction: true,
+
+        vibrate: [
+            500,
+            200,
+            500,
+            200,
+            1000
+        ],
+
+        data: data.data || {},
+
+        actions: [
+            {
+                action: "open",
+                title: "OPEN FIRE GUARD"
+            }
+        ]
+    };
+
+
+    event.waitUntil(
+        self.registration.showNotification(
+            data.title || "SMART FIRE GUARD",
+            options
+        )
+    );
+});
+
+
+self.addEventListener("notificationclick", event => {
+
+    event.notification.close();
+
+    const url =
+        event.notification.data &&
+        event.notification.data.url
+            ? event.notification.data.url
+            : "/dashboard";
+
+
+    event.waitUntil(
+
+        clients.matchAll({
+            type: "window",
+            includeUncontrolled: true
+        }).then(clientList => {
+
+            for (const client of clientList) {
+
+                if ("focus" in client) {
+
+                    client.navigate(url);
+
+                    return client.focus();
+                }
+            }
+
+            if (clients.openWindow) {
+                return clients.openWindow(url);
+            }
+
+        })
+    );
+});
+"""
+
+
+@app.route("/sw.js")
+def service_worker():
+    response = app.response_class(
+        SERVICE_WORKER,
+        mimetype="application/javascript"
+    )
+
+    response.headers["Service-Worker-Allowed"] = "/"
+
+    return response
+
+
+# ---------------------------------------------------------
+# HOME
+# ---------------------------------------------------------
+
+@app.route("/")
+def home():
+
+    if session.get("owner_id"):
+        return redirect(url_for("dashboard"))
+
+    return redirect(url_for("register"))
+
+
+# ---------------------------------------------------------
+# REGISTER
+# ---------------------------------------------------------
+
+REGISTER_HTML = """
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
 <title>Smart Fire Guard</title>
 
 <style>
-:root{
-    --bg:#070a0f;
-    --panel:#10151e;
-    --panel2:#151c27;
-    --border:#2a3443;
-    --text:#f7f8fa;
-    --muted:#9ba7b8;
-    --red:#ff3b30;
-    --orange:#ff7a00;
-    --yellow:#ffbd2e;
-    --green:#25d68a;
-    --blue:#4da3ff;
-    --shadow:0 18px 45px rgba(0,0,0,.35);
+
+* {
+    box-sizing: border-box;
 }
 
-*{box-sizing:border-box}
+body {
+    margin: 0;
+    font-family: Arial, sans-serif;
 
-body{
-    margin:0;
-    min-height:100vh;
-    font-family:Inter,Arial,sans-serif;
     background:
-      radial-gradient(circle at 75% 0%,rgba(255,74,0,.16),transparent 30%),
-      radial-gradient(circle at 10% 100%,rgba(255,59,48,.08),transparent 30%),
-      var(--bg);
-    color:var(--text);
+        radial-gradient(circle at top, #401010, #090909 65%);
+
+    color: white;
+
+    min-height: 100vh;
+
+    display: flex;
+    align-items: center;
+    justify-content: center;
+
+    padding: 20px;
 }
 
-button,input,textarea{font:inherit}
+.card {
+    width: 100%;
+    max-width: 520px;
 
-button{cursor:pointer}
+    background: rgba(25,25,25,.95);
 
-.auth-wrap{
-    min-height:100vh;
-    display:flex;
-    align-items:center;
-    justify-content:center;
-    padding:25px;
+    border: 1px solid #5a1b1b;
+
+    border-radius: 24px;
+
+    padding: 30px;
+
+    box-shadow:
+        0 20px 60px rgba(0,0,0,.6);
 }
 
-.auth-card{
-    width:min(480px,100%);
-    background:rgba(16,21,30,.94);
-    border:1px solid var(--border);
-    border-radius:24px;
-    padding:32px;
-    box-shadow:var(--shadow);
+.logo {
+    text-align: center;
+
+    font-size: 42px;
+
+    margin-bottom: 5px;
 }
 
-.fire-logo{
-    width:65px;
-    height:65px;
-    border-radius:19px;
-    display:flex;
-    align-items:center;
-    justify-content:center;
-    font-size:32px;
-    background:linear-gradient(145deg,var(--red),var(--orange));
-    box-shadow:0 10px 30px rgba(255,59,48,.25);
-    margin-bottom:18px;
+h1 {
+    text-align: center;
+
+    margin: 0;
+
+    color: #ff4b35;
 }
 
-h1,h2,h3{margin-top:0}
+.subtitle {
+    text-align: center;
 
-.subtitle{color:var(--muted)}
+    color: #aaa;
 
-input,textarea{
-    width:100%;
-    padding:13px 14px;
-    border-radius:11px;
-    border:1px solid var(--border);
-    background:#0b1017;
-    color:white;
-    outline:none;
-    margin:6px 0 12px;
+    margin-bottom: 30px;
 }
 
-input:focus,textarea:focus{
-    border-color:var(--orange);
-    box-shadow:0 0 0 3px rgba(255,122,0,.1);
+label {
+    display: block;
+
+    margin-top: 15px;
+
+    color: #ddd;
+
+    font-size: 14px;
 }
 
-textarea{min-height:110px;resize:vertical}
+input {
+    width: 100%;
 
-.btn{
-    border:0;
-    border-radius:11px;
-    padding:12px 17px;
-    font-weight:700;
-    margin:4px;
+    padding: 14px;
+
+    margin-top: 7px;
+
+    border-radius: 10px;
+
+    border: 1px solid #444;
+
+    background: #111;
+
+    color: white;
+
+    font-size: 16px;
 }
 
-.btn-fire{
-    color:white;
-    background:linear-gradient(135deg,var(--red),var(--orange));
+button {
+    width: 100%;
+
+    margin-top: 22px;
+
+    padding: 15px;
+
+    border: none;
+
+    border-radius: 12px;
+
+    background: linear-gradient(
+        135deg,
+        #ff3b20,
+        #ff7a18
+    );
+
+    color: white;
+
+    font-size: 17px;
+
+    font-weight: bold;
+
+    cursor: pointer;
 }
 
-.btn-green{background:var(--green);color:#06130d}
-.btn-blue{background:var(--blue);color:#06101b}
-.btn-dark{background:#283344;color:white}
-.btn-danger{background:#b91c2c;color:white}
-
-.link-btn{
-    background:none;
-    border:0;
-    color:#ff9b52;
-    padding:8px;
+button:hover {
+    opacity: .9;
 }
 
-.hidden{display:none!important}
+.info {
+    margin-top: 20px;
 
-#dashboardApp{display:none}
+    padding: 14px;
 
-.sidebar{
-    position:fixed;
-    inset:0 auto 0 0;
-    width:250px;
-    padding:24px 15px;
-    background:rgba(12,17,25,.96);
-    border-right:1px solid var(--border);
-    z-index:20;
+    background: #181818;
+
+    border-radius: 10px;
+
+    color: #aaa;
+
+    font-size: 13px;
+
+    line-height: 1.5;
 }
 
-.brand{
-    display:flex;
-    align-items:center;
-    gap:11px;
-    padding:8px 10px 25px;
-    font-weight:800;
-    font-size:18px;
-}
-
-.brand-icon{
-    width:38px;height:38px;
-    border-radius:11px;
-    display:flex;align-items:center;justify-content:center;
-    background:linear-gradient(145deg,var(--red),var(--orange));
-}
-
-.nav button{
-    width:100%;
-    border:0;
-    background:transparent;
-    color:#aeb8c8;
-    text-align:left;
-    padding:13px 14px;
-    border-radius:11px;
-    margin:3px 0;
-}
-
-.nav button:hover,.nav button.active{
-    color:white;
-    background:linear-gradient(90deg,rgba(255,59,48,.18),rgba(255,122,0,.08));
-    border-left:3px solid var(--orange);
-}
-
-.main{
-    margin-left:250px;
-    padding:30px;
-    max-width:1450px;
-}
-
-.topbar{
-    display:flex;
-    justify-content:space-between;
-    align-items:center;
-    gap:15px;
-    margin-bottom:24px;
-}
-
-.live{
-    display:flex;
-    align-items:center;
-    gap:8px;
-    color:#8eeec0;
-    font-size:13px;
-}
-
-.dot{
-    width:9px;height:9px;border-radius:50%;
-    background:var(--green);
-    box-shadow:0 0 12px var(--green);
-}
-
-.card{
-    background:linear-gradient(145deg,rgba(20,27,38,.96),rgba(13,18,27,.96));
-    border:1px solid var(--border);
-    border-radius:18px;
-    padding:23px;
-    margin-bottom:20px;
-    box-shadow:0 10px 30px rgba(0,0,0,.18);
-}
-
-.hero{
-    position:relative;
-    overflow:hidden;
-    background:
-      radial-gradient(circle at 90% 20%,rgba(255,122,0,.24),transparent 35%),
-      linear-gradient(135deg,#221116,#131923 65%);
-}
-
-.hero:after{
-    content:"🔥";
-    position:absolute;
-    right:35px;
-    top:22px;
-    font-size:75px;
-    opacity:.12;
-}
-
-.grid{
-    display:grid;
-    grid-template-columns:repeat(auto-fit,minmax(190px,1fr));
-    gap:15px;
-}
-
-.stat{
-    background:#0b1017;
-    border:1px solid #202a38;
-    border-radius:15px;
-    padding:20px;
-}
-
-.stat-label{
-    color:var(--muted);
-    font-size:13px;
-}
-
-.stat-value{
-    margin-top:9px;
-    font-size:25px;
-    font-weight:800;
-}
-
-.safe{color:var(--green)}
-.fire{color:#ff5b52}
-
-.alert{
-    border:1px solid rgba(255,59,48,.35);
-    border-left:5px solid var(--red);
-    background:rgba(105,20,24,.25);
-    padding:17px;
-    border-radius:12px;
-    margin:10px 0;
-}
-
-.maintenance{
-    border:1px solid rgba(77,163,255,.25);
-    border-left:5px solid var(--blue);
-    background:rgba(30,75,120,.2);
-    padding:17px;
-    border-radius:12px;
-    margin:10px 0;
-}
-
-.muted{color:var(--muted);font-size:13px}
-
-#toast{
-    position:fixed;
-    right:20px;
-    bottom:20px;
-    width:min(380px,calc(100% - 40px));
-    padding:15px 18px;
-    border-radius:13px;
-    background:#1c2635;
-    border:1px solid #35445a;
-    box-shadow:var(--shadow);
-    display:none;
-    z-index:100;
-}
-
-@media(max-width:760px){
-    .sidebar{
-        width:70px;
-        padding:15px 7px;
-    }
-
-    .brand span,.nav-label{display:none}
-
-    .brand{justify-content:center}
-
-    .nav button{text-align:center}
-
-    .main{
-        margin-left:70px;
-        padding:16px;
-    }
-}
 </style>
+
 </head>
 
 <body>
 
-<!-- =========================================================
-     LOGIN / REGISTER
-========================================================= -->
+<div class="card">
 
-<div id="authScreen" class="auth-wrap">
-    <div class="auth-card">
+    <div class="logo">🔥</div>
 
-        <div class="fire-logo">🔥</div>
+    <h1>SMART FIRE GUARD</h1>
 
-        <h1>Smart Fire Guard</h1>
-        <p class="subtitle">
-            Automatic Fire Detection & Alert System
-        </p>
+    <div class="subtitle">
+        Automatic Fire Detection & Alert System
+    </div>
 
-        <div id="registerPanel">
-            <h2>Create your account</h2>
+    <form method="POST">
 
-            <input id="regName" placeholder="Full Name">
-            <input id="regPhone" placeholder="Phone Number">
-            <input id="regEmail" type="email" placeholder="Email Address">
-            <input id="regDevice" placeholder="Device ID">
-            <input id="regAddress" placeholder="Location / Address">
-            <input id="regPassword" type="password" placeholder="Password">
+        <label>Owner Name</label>
 
-            <button class="btn btn-fire" onclick="registerUser()">
-                Create Account
-            </button>
+        <input
+            name="name"
+            required
+            placeholder="Enter owner name"
+        >
 
-            <button class="link-btn" onclick="showLogin()">
-                Already registered? Login
-            </button>
-        </div>
 
-        <div id="loginPanel" class="hidden">
-            <h2>Welcome back</h2>
+        <label>Phone Number</label>
 
-            <input id="loginEmail" type="email" placeholder="Email Address">
-            <input id="loginPassword" type="password" placeholder="Password">
+        <input
+            name="phone"
+            placeholder="+91XXXXXXXXXX"
+        >
 
-            <button class="btn btn-fire" onclick="loginUser()">
-                Login
-            </button>
 
-            <button class="link-btn" onclick="showRegister()">
-                New user? Create account
-            </button>
-        </div>
+        <label>Email Address</label>
+
+        <input
+            name="email"
+            type="email"
+            placeholder="example@email.com"
+        >
+
+
+        <label>Fire Guard Location</label>
+
+        <input
+            name="location"
+            placeholder="Home / Office / Shop"
+        >
+
+
+        <label>Device ID</label>
+
+        <input
+            name="device_id"
+            placeholder="Fire Guard device ID"
+        >
+
+
+        <button type="submit">
+            REGISTER FIRE GUARD
+        </button>
+
+    </form>
+
+
+    <div class="info">
+
+        🔔 After registration, enable browser notifications
+        from the dashboard.
+
+        <br><br>
+
+        Your registration is saved on this device/server,
+        so you can return directly to the dashboard later.
 
     </div>
+
 </div>
-
-
-<!-- =========================================================
-     DASHBOARD
-========================================================= -->
-
-<div id="dashboardApp">
-
-<aside class="sidebar">
-
-    <div class="brand">
-        <div class="brand-icon">🔥</div>
-        <span>SMART FIRE GUARD</span>
-    </div>
-
-    <nav class="nav">
-        <button id="navDashboard" onclick="showPage('dashboard')">
-            🏠 <span class="nav-label">Dashboard</span>
-        </button>
-
-        <button id="navProfile" onclick="showPage('profile')">
-            👤 <span class="nav-label">My Profile</span>
-        </button>
-
-        <button id="navMaintenance" onclick="showPage('maintenance')">
-            🔧 <span class="nav-label">Maintenance</span>
-        </button>
-
-        <button id="navAlerts" onclick="showPage('alerts')">
-            🚨 <span class="nav-label">Fire Alerts</span>
-        </button>
-
-        <button id="navTest" onclick="showPage('test')">
-            🧪 <span class="nav-label">System Test</span>
-        </button>
-
-        <button onclick="logout()">
-            🚪 <span class="nav-label">Logout</span>
-        </button>
-    </nav>
-
-</aside>
-
-<main class="main">
-
-    <div class="topbar">
-        <div>
-            <h1 id="pageTitle">Dashboard</h1>
-            <div class="muted">Smart Fire Guard Control Center</div>
-        </div>
-
-        <div class="live">
-            <span class="dot"></span>
-            Server connected
-        </div>
-    </div>
-
-
-    <!-- DASHBOARD -->
-    <section id="pageDashboard" class="page">
-
-        <div class="card hero">
-            <h2>Hello, <span id="welcomeName"></span> 👋</h2>
-            <p class="subtitle">
-                Your fire protection system is being monitored.
-            </p>
-            <p class="muted">
-                Device ID: <span id="welcomeDevice"></span>
-            </p>
-        </div>
-
-        <div class="grid">
-
-            <div class="stat">
-                <div class="stat-label">SYSTEM STATUS</div>
-                <div id="systemStatus" class="stat-value safe">SAFE</div>
-            </div>
-
-            <div class="stat">
-                <div class="stat-label">FIRE SENSOR</div>
-                <div id="flameStatus" class="stat-value">SAFE</div>
-            </div>
-
-            <div class="stat">
-                <div class="stat-label">TEMPERATURE</div>
-                <div id="temperatureStatus" class="stat-value">0 °C</div>
-            </div>
-
-            <div class="stat">
-                <div class="stat-label">PUMP / RELAY</div>
-                <div id="pumpStatus" class="stat-value">OFF</div>
-            </div>
-
-        </div>
-
-        <div class="card">
-            <h2>Live System</h2>
-            <p id="liveText" class="subtitle">
-                System is operating normally.
-            </p>
-        </div>
-
-    </section>
-
-
-    <!-- PROFILE -->
-    <section id="pageProfile" class="page hidden">
-
-        <div class="card">
-            <h2>👤 My Profile</h2>
-            <p class="subtitle">
-                Update your registration information.
-            </p>
-
-            <input id="profileName" placeholder="Full Name">
-            <input id="profilePhone" placeholder="Phone Number">
-            <input id="profileEmail" type="email" placeholder="Email">
-            <input id="profileDevice" placeholder="Device ID">
-            <input id="profileAddress" placeholder="Location / Address">
-
-            <button class="btn btn-green" onclick="saveProfile()">
-                Save Changes
-            </button>
-        </div>
-
-    </section>
-
-
-    <!-- MAINTENANCE -->
-    <section id="pageMaintenance" class="page hidden">
-
-        <div class="card">
-            <h2>🔧 Maintenance Notifications</h2>
-            <p class="subtitle">
-                Maintenance messages sent by the administrator.
-            </p>
-
-            <div id="maintenanceList"></div>
-        </div>
-
-    </section>
-
-
-    <!-- ALERTS -->
-    <section id="pageAlerts" class="page hidden">
-
-        <div class="card">
-            <h2>🚨 Fire Alerts</h2>
-            <p class="subtitle">
-                Recent fire events and their locations.
-            </p>
-
-            <div id="alertsList"></div>
-        </div>
-
-    </section>
-
-
-    <!-- TEST -->
-    <section id="pageTest" class="page hidden">
-
-        <div class="card hero">
-            <h2>🧪 System Test</h2>
-
-            <p class="subtitle">
-                Test Fire will ask for this browser's current location
-                and broadcast the alert to all currently open dashboards.
-            </p>
-
-            <button class="btn btn-fire" onclick="testFire()">
-                🔥 TEST FIRE
-            </button>
-
-            <button class="btn btn-green" onclick="resetSystem()">
-                Reset System
-            </button>
-        </div>
-
-    </section>
-
-</main>
-</div>
-
-<div id="toast"></div>
-
-
-<script>
-let browserId = localStorage.getItem("smartFireBrowserId");
-
-if (!browserId) {
-    browserId = crypto.randomUUID();
-    localStorage.setItem("smartFireBrowserId", browserId);
-}
-
-let lastEventId = 0;
-let maintenanceCursor = 0;
-
-
-function toast(message) {
-    const box = document.getElementById("toast");
-    box.textContent = message;
-    box.style.display = "block";
-
-    setTimeout(() => {
-        box.style.display = "none";
-    }, 4500);
-}
-
-
-function showRegister() {
-    document.getElementById("loginPanel").classList.add("hidden");
-    document.getElementById("registerPanel").classList.remove("hidden");
-}
-
-
-function showLogin() {
-    document.getElementById("registerPanel").classList.add("hidden");
-    document.getElementById("loginPanel").classList.remove("hidden");
-}
-
-
-async function registerUser() {
-
-    const response = await fetch("/api/register", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({
-            name: regName.value.trim(),
-            phone: regPhone.value.trim(),
-            email: regEmail.value.trim(),
-            device_id: regDevice.value.trim(),
-            address: regAddress.value.trim(),
-            password: regPassword.value
-        })
-    });
-
-    const data = await response.json();
-
-    if (!data.ok) {
-        toast(data.error);
-        return;
-    }
-
-    toast("Account created successfully.");
-    openDashboard();
-}
-
-
-async function loginUser() {
-
-    const response = await fetch("/api/login", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({
-            email: loginEmail.value.trim(),
-            password: loginPassword.value
-        })
-    });
-
-    const data = await response.json();
-
-    if (!data.ok) {
-        toast(data.error);
-        return;
-    }
-
-    openDashboard();
-}
-
-
-async function checkLogin() {
-
-    const response = await fetch("/api/me");
-
-    if (response.ok) {
-        openDashboard();
-    }
-}
-
-
-async function openDashboard() {
-
-    document.getElementById("authScreen").style.display = "none";
-    document.getElementById("dashboardApp").style.display = "block";
-
-    await loadProfile();
-    await loadStatus();
-    await loadMaintenance();
-    await loadAlerts();
-
-    showPage("dashboard");
-
-    registerBrowser();
-}
-
-
-function showPage(name) {
-
-    document.querySelectorAll(".page").forEach(
-        page => page.classList.add("hidden")
-    );
-
-    const target = document.getElementById("page" + name.charAt(0).toUpperCase() + name.slice(1));
-
-    if (target) target.classList.remove("hidden");
-
-    document.querySelectorAll(".nav button").forEach(
-        button => button.classList.remove("active")
-    );
-
-    const nav = document.getElementById(
-        "nav" + name.charAt(0).toUpperCase() + name.slice(1)
-    );
-
-    if (nav) nav.classList.add("active");
-
-    const titles = {
-        dashboard: "Dashboard",
-        profile: "My Profile",
-        maintenance: "Maintenance",
-        alerts: "Fire Alerts",
-        test: "System Test"
-    };
-
-    document.getElementById("pageTitle").textContent = titles[name];
-}
-
-
-async function loadProfile() {
-
-    const response = await fetch("/api/me");
-
-    if (!response.ok) return;
-
-    const user = await response.json();
-
-    welcomeName.textContent = user.name;
-    welcomeDevice.textContent = user.device_id;
-
-    profileName.value = user.name;
-    profilePhone.value = user.phone;
-    profileEmail.value = user.email;
-    profileDevice.value = user.device_id;
-    profileAddress.value = user.address;
-}
-
-
-async function saveProfile() {
-
-    const response = await fetch("/api/profile", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({
-            name: profileName.value.trim(),
-            phone: profilePhone.value.trim(),
-            email: profileEmail.value.trim(),
-            device_id: profileDevice.value.trim(),
-            address: profileAddress.value.trim()
-        })
-    });
-
-    const data = await response.json();
-
-    if (!data.ok) {
-        toast(data.error);
-        return;
-    }
-
-    toast("Profile updated successfully.");
-    loadProfile();
-}
-
-
-async function loadStatus() {
-
-    const response = await fetch("/api/status");
-
-    if (!response.ok) return;
-
-    const status = await response.json();
-
-    systemStatus.textContent = status.fire ? "FIRE DETECTED" : "SAFE";
-    systemStatus.className =
-        "stat-value " + (status.fire ? "fire" : "safe");
-
-    flameStatus.textContent = status.flame;
-    temperatureStatus.textContent = status.temperature + " °C";
-    pumpStatus.textContent = status.extinguisher;
-
-    liveText.textContent = status.fire
-        ? "🔥 Fire detected. Please check the alert location."
-        : "System is operating normally.";
-}
-
-
-function getLocation() {
-
-    return new Promise((resolve, reject) => {
-
-        if (!navigator.geolocation) {
-            reject(new Error("This browser does not support location."));
-            return;
-        }
-
-        navigator.geolocation.getCurrentPosition(
-            position => resolve({
-                latitude: position.coords.latitude,
-                longitude: position.coords.longitude,
-                accuracy: position.coords.accuracy
-            }),
-            () => reject(
-                new Error("Please allow location access to test the fire alert.")
-            ),
-            {
-                enableHighAccuracy: true,
-                timeout: 12000,
-                maximumAge: 0
-            }
-        );
-    });
-}
-
-
-async function testFire() {
-
-    try {
-
-        const location = await getLocation();
-
-        const response = await fetch("/api/test-fire", {
-            method: "POST",
-            headers: {"Content-Type":"application/json"},
-            body: JSON.stringify(location)
-        });
-
-        const data = await response.json();
-
-        if (!data.ok) {
-            toast(data.error);
-            return;
-        }
-
-        toast("🔥 Fire alert sent to all open dashboards.");
-
-        await loadStatus();
-        await loadAlerts();
-
-    } catch (error) {
-        toast(error.message);
-    }
-}
-
-
-async function resetSystem() {
-
-    const response = await fetch("/api/reset", {
-        method: "POST"
-    });
-
-    const data = await response.json();
-
-    toast(data.message || data.error);
-    loadStatus();
-}
-
-
-async function loadMaintenance() {
-
-    const response = await fetch("/api/maintenance");
-
-    if (!response.ok) return;
-
-    const items = await response.json();
-
-    maintenanceList.innerHTML = "";
-
-    if (!items.length) {
-        maintenanceList.innerHTML =
-            '<p class="muted">No maintenance notifications yet.</p>';
-        return;
-    }
-
-    items.forEach(item => {
-
-        maintenanceList.innerHTML += `
-            <div class="maintenance">
-                <h3>${safe(item.title)}</h3>
-                <p>${safe(item.message)}</p>
-                <div class="muted">${safe(item.created_at)}</div>
-            </div>
-        `;
-    });
-}
-
-
-async function loadAlerts() {
-
-    const response = await fetch("/api/alerts");
-
-    if (!response.ok) return;
-
-    const items = await response.json();
-
-    alertsList.innerHTML = "";
-
-    if (!items.length) {
-        alertsList.innerHTML =
-            '<p class="muted">No fire alerts yet.</p>';
-        return;
-    }
-
-    items.forEach(item => {
-
-        const map =
-            "https://www.google.com/maps?q=" +
-            item.latitude + "," + item.longitude;
-
-        alertsList.innerHTML += `
-            <div class="alert">
-                <h3>🔥 Fire Detected</h3>
-                <p>Device: ${safe(item.device_id)}</p>
-                <p>Time: ${safe(item.created_at)}</p>
-                <p>
-                    Location:
-                    ${item.latitude}, ${item.longitude}
-                </p>
-                <a href="${map}" target="_blank"
-                   style="color:#ff9b52;font-weight:bold">
-                    Open Fire Location →
-                </a>
-            </div>
-        `;
-    });
-}
-
-
-async function registerBrowser() {
-
-    await fetch("/api/open", {
-        method: "POST",
-        headers: {"Content-Type":"application/json"},
-        body: JSON.stringify({browser_id: browserId})
-    });
-}
-
-
-async function pollEvents() {
-
-    const response = await fetch(
-        "/api/events?browser_id=" +
-        encodeURIComponent(browserId) +
-        "&after=" + lastEventId +
-        "&maintenance_after=" + maintenanceCursor
-    );
-
-    if (!response.ok) return;
-
-    const data = await response.json();
-
-    data.alerts.forEach(alert => {
-
-        lastEventId = Math.max(lastEventId, alert.id);
-
-        toast(
-            "🔥 FIRE ALERT — " +
-            alert.latitude + ", " +
-            alert.longitude
-        );
-
-        loadStatus();
-        loadAlerts();
-
-        if (
-            "Notification" in window &&
-            Notification.permission === "granted"
-        ) {
-            new Notification("🔥 SMART FIRE GUARD", {
-                body:
-                    "Fire detected at " +
-                    alert.latitude + ", " +
-                    alert.longitude
-            });
-        }
-    });
-
-    data.maintenance.forEach(item => {
-
-        maintenanceCursor = Math.max(
-            maintenanceCursor,
-            item.id
-        );
-
-        toast("🔧 Maintenance: " + item.title);
-
-        if (
-            "Notification" in window &&
-            Notification.permission === "granted"
-        ) {
-            new Notification("🔧 Maintenance Notice", {
-                body: item.title + ": " + item.message
-            });
-        }
-    });
-}
-
-
-function requestBrowserNotifications() {
-
-    if ("Notification" in window &&
-        Notification.permission === "default") {
-
-        Notification.requestPermission();
-    }
-}
-
-
-async function logout() {
-
-    await fetch("/api/logout", {
-        method: "POST"
-    });
-
-    location.reload();
-}
-
-
-function safe(value) {
-
-    return String(value)
-        .replaceAll("&","&amp;")
-        .replaceAll("<","&lt;")
-        .replaceAll(">","&gt;")
-        .replaceAll('"',"&quot;")
-        .replaceAll("'","&#039;");
-}
-
-
-setInterval(pollEvents, 2000);
-setInterval(loadStatus, 3000);
-
-checkLogin();
-</script>
 
 </body>
 </html>
 """
 
 
-# ============================================================
-# BASIC ROUTES
-# ============================================================
-
-@app.route("/")
-def home():
-    return render_template_string(PAGE)
-
-
-# ============================================================
-# AUTHENTICATION
-# ============================================================
-
-@app.route("/api/register", methods=["POST"])
+@app.route("/register", methods=["GET", "POST"])
 def register():
 
-    data = request.get_json(silent=True) or {}
+    if session.get("owner_id"):
+        return redirect(url_for("dashboard"))
 
-    name = str(data.get("name", "")).strip()
-    phone = str(data.get("phone", "")).strip()
-    email = str(data.get("email", "")).strip().lower()
-    device_id = str(data.get("device_id", "")).strip()
-    address = str(data.get("address", "")).strip()
-    password = str(data.get("password", ""))
+    if request.method == "POST":
 
-    if not all([name, phone, email, device_id, password]):
-        return jsonify({
-            "ok": False,
-            "error": "Please fill all required fields."
-        }), 400
+        name = request.form.get("name", "").strip()
+        phone = request.form.get("phone", "").strip()
+        email = request.form.get("email", "").strip()
+        location = request.form.get("location", "").strip()
+        device_id = request.form.get("device_id", "").strip()
 
-    conn = get_db()
+        if not name:
+            return "Owner name is required.", 400
 
-    try:
-        cursor = conn.execute("""
-            INSERT INTO users
-            (name, phone, email, password_hash, device_id, address, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            name,
-            phone,
-            email,
-            hash_password(password),
-            device_id,
-            address,
-            utc_now()
-        ))
+        conn = get_db()
 
-        conn.commit()
-        user_id = cursor.lastrowid
+        cursor = conn.execute(
+            """
+            INSERT INTO owners
+            (name, phone, email, location, device_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                name,
+                phone,
+                email,
+                location,
+                device_id,
+                datetime.utcnow().isoformat()
+            )
+        )
 
-    except sqlite3.IntegrityError:
-        conn.close()
-        return jsonify({
-            "ok": False,
-            "error": "Email or Device ID is already registered."
-        }), 409
-
-    conn.close()
-
-    session["user_id"] = user_id
-
-    return jsonify({"ok": True})
-
-
-@app.route("/api/login", methods=["POST"])
-def login():
-
-    data = request.get_json(silent=True) or {}
-
-    email = str(data.get("email", "")).strip().lower()
-    password = str(data.get("password", ""))
-
-    conn = get_db()
-
-    user = conn.execute("""
-        SELECT id FROM users
-        WHERE email = ? AND password_hash = ?
-    """, (
-        email,
-        hash_password(password)
-    )).fetchone()
-
-    conn.close()
-
-    if not user:
-        return jsonify({
-            "ok": False,
-            "error": "Invalid email or password."
-        }), 401
-
-    session["user_id"] = user["id"]
-
-    return jsonify({"ok": True})
-
-
-@app.route("/api/logout", methods=["POST"])
-def logout():
-
-    session.clear()
-
-    return jsonify({"ok": True})
-
-
-@app.route("/api/me")
-def me():
-
-    user = get_current_user()
-
-    if not user:
-        return jsonify({"ok": False}), 401
-
-    return jsonify({
-        "id": user["id"],
-        "name": user["name"],
-        "phone": user["phone"],
-        "email": user["email"],
-        "device_id": user["device_id"],
-        "address": user["address"]
-    })
-
-
-# ============================================================
-# PROFILE
-# ============================================================
-
-@app.route("/api/profile", methods=["POST"])
-@login_required
-def update_profile():
-
-    user = get_current_user()
-    data = request.get_json(silent=True) or {}
-
-    name = str(data.get("name", "")).strip()
-    phone = str(data.get("phone", "")).strip()
-    email = str(data.get("email", "")).strip().lower()
-    device_id = str(data.get("device_id", "")).strip()
-    address = str(data.get("address", "")).strip()
-
-    if not all([name, phone, email, device_id]):
-        return jsonify({
-            "ok": False,
-            "error": "Name, phone, email and device ID are required."
-        }), 400
-
-    conn = get_db()
-
-    try:
-        conn.execute("""
-            UPDATE users
-            SET name = ?, phone = ?, email = ?, device_id = ?, address = ?
-            WHERE id = ?
-        """, (
-            name,
-            phone,
-            email,
-            device_id,
-            address,
-            user["id"]
-        ))
+        owner_id = cursor.lastrowid
 
         conn.commit()
-
-    except sqlite3.IntegrityError:
         conn.close()
-        return jsonify({
-            "ok": False,
-            "error": "Email or Device ID is already used."
-        }), 409
 
-    conn.close()
+        session["owner_id"] = owner_id
 
-    return jsonify({"ok": True})
+        return redirect(url_for("dashboard"))
+
+    return render_template_string(REGISTER_HTML)
 
 
-# ============================================================
-# OPEN BROWSER REGISTRY
-# ============================================================
+# ---------------------------------------------------------
+# DASHBOARD
+# ---------------------------------------------------------
 
-@app.route("/api/open", methods=["POST"])
-@login_required
-def open_browser():
+DASHBOARD_HTML = """
+<!DOCTYPE html>
 
-    data = request.get_json(silent=True) or {}
-    browser_id = str(data.get("browser_id", "")).strip()
+<html>
 
-    if browser_id:
-        open_browsers.add(browser_id)
+<head>
 
-    return jsonify({"ok": True})
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Smart Fire Guard Dashboard</title>
+
+<style>
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+
+    font-family: Arial, sans-serif;
+
+    background: #080808;
+
+    color: white;
+}
+
+.sidebar {
+    position: fixed;
+
+    left: 0;
+    top: 0;
+    bottom: 0;
+
+    width: 250px;
+
+    background:
+        linear-gradient(
+            180deg,
+            #241010,
+            #0e0e0e
+        );
+
+    border-right: 1px solid #3d2020;
+
+    padding: 25px;
+}
+
+.brand {
+    font-size: 22px;
+
+    font-weight: bold;
+
+    color: #ff543b;
+
+    margin-bottom: 40px;
+}
+
+.menu {
+    display: block;
+
+    padding: 14px;
+
+    margin-bottom: 8px;
+
+    border-radius: 10px;
+
+    color: #ccc;
+
+    text-decoration: none;
+}
+
+.menu:hover,
+.menu.active {
+    background: #321515;
+
+    color: white;
+}
+
+.main {
+    margin-left: 250px;
+
+    padding: 30px;
+}
+
+.header {
+    display: flex;
+
+    justify-content: space-between;
+
+    align-items: center;
+
+    margin-bottom: 25px;
+}
+
+.header h1 {
+    margin: 0;
+}
+
+.status {
+    padding: 10px 15px;
+
+    border-radius: 20px;
+
+    background: #12351d;
+
+    color: #67e58b;
+}
+
+.cards {
+    display: grid;
+
+    grid-template-columns:
+        repeat(auto-fit, minmax(190px, 1fr));
+
+    gap: 18px;
+}
+
+.card {
+    background: #151515;
+
+    border: 1px solid #2e2e2e;
+
+    border-radius: 18px;
+
+    padding: 22px;
+}
+
+.card h3 {
+    color: #aaa;
+
+    margin-top: 0;
+}
+
+.value {
+    font-size: 30px;
+
+    font-weight: bold;
+}
+
+.safe {
+    color: #54e27c;
+}
+
+.danger {
+    color: #ff4d36;
+}
+
+.notification {
+    margin-top: 25px;
+
+    padding: 25px;
+
+    background:
+        linear-gradient(
+            135deg,
+            #241313,
+            #151515
+        );
+
+    border: 1px solid #522323;
+
+    border-radius: 18px;
+}
+
+button {
+    border: none;
+
+    border-radius: 10px;
+
+    padding: 13px 18px;
+
+    margin: 6px;
+
+    cursor: pointer;
+
+    font-weight: bold;
+
+    color: white;
+
+    background: #e63d27;
+}
+
+button.secondary {
+    background: #333;
+}
+
+button.green {
+    background: #18733a;
+}
+
+.profile {
+    margin-top: 25px;
+}
+
+.profile p {
+    color: #bbb;
+}
+
+.alert {
+    display: none;
+
+    margin-top: 20px;
+
+    padding: 20px;
+
+    background: #461515;
+
+    border: 1px solid #ff3d2e;
+
+    border-radius: 14px;
+
+    color: #ff897c;
+}
+
+@media(max-width: 800px) {
+
+    .sidebar {
+        position: static;
+
+        width: 100%;
+
+        height: auto;
+    }
+
+    .main {
+        margin-left: 0;
+
+        padding: 18px;
+    }
+
+    .header {
+        flex-direction: column;
+
+        align-items: flex-start;
+
+        gap: 12px;
+    }
+
+}
+
+</style>
+
+</head>
 
 
-# ============================================================
-# FIRE STATUS
-# ============================================================
+<body>
 
-fire_status = {
-    "fire": False,
-    "flame": "SAFE",
-    "temperature": 0,
-    "extinguisher": "OFF"
+
+<div class="sidebar">
+
+    <div class="brand">
+        🔥 SMART FIRE GUARD
+    </div>
+
+    <a class="menu active" href="/dashboard">
+        🏠 Dashboard
+    </a>
+
+    <a class="menu" href="/profile">
+        👤 Owner Details
+    </a>
+
+    <a class="menu" href="/logout">
+        🚪 Logout
+    </a>
+
+</div>
+
+
+<div class="main">
+
+    <div class="header">
+
+        <h1>Fire Guard Dashboard</h1>
+
+        <div class="status" id="systemStatus">
+            ● SYSTEM SAFE
+        </div>
+
+    </div>
+
+
+    <div class="cards">
+
+        <div class="card">
+
+            <h3>🔥 Flame</h3>
+
+            <div
+                class="value safe"
+                id="flame"
+            >
+                SAFE
+            </div>
+
+        </div>
+
+
+        <div class="card">
+
+            <h3>🌡 Temperature</h3>
+
+            <div
+                class="value"
+                id="temperature"
+            >
+                0°C
+            </div>
+
+        </div>
+
+
+        <div class="card">
+
+            <h3>🧯 Extinguisher</h3>
+
+            <div
+                class="value"
+                id="extinguisher"
+            >
+                OFF
+            </div>
+
+        </div>
+
+
+        <div class="card">
+
+            <h3>🔔 Notification</h3>
+
+            <div
+                class="value"
+                id="notification"
+            >
+                READY
+            </div>
+
+        </div>
+
+    </div>
+
+
+    <div class="notification">
+
+        <h2>🔔 Web Push Notifications</h2>
+
+        <p id="notificationStatus">
+            Notifications are not enabled.
+        </p>
+
+        <button
+            class="green"
+            onclick="enableNotifications()"
+        >
+            ENABLE NOTIFICATIONS
+        </button>
+
+    </div>
+
+
+    <div class="notification">
+
+        <h2>🔥 Fire Detection Test</h2>
+
+        <p>
+            Use this button to simulate a fire detection event.
+        </p>
+
+        <button onclick="testFire()">
+            TEST FIRE
+        </button>
+
+        <button
+            class="secondary"
+            onclick="resetSystem()"
+        >
+            RESET SYSTEM
+        </button>
+
+    </div>
+
+
+    <div
+        class="alert"
+        id="fireAlert"
+    >
+        🔥 FIRE DETECTED! Check the protected location immediately.
+    </div>
+
+
+    <div class="profile">
+
+        <div class="card">
+
+            <h2>Owner Information</h2>
+
+            <p>
+                <b>Name:</b>
+                {{ owner["name"] }}
+            </p>
+
+            <p>
+                <b>Phone:</b>
+                {{ owner["phone"] or "Not provided" }}
+            </p>
+
+            <p>
+                <b>Email:</b>
+                {{ owner["email"] or "Not provided" }}
+            </p>
+
+            <p>
+                <b>Location:</b>
+                {{ owner["location"] or "Not provided" }}
+            </p>
+
+            <p>
+                <b>Device ID:</b>
+                {{ owner["device_id"] or "Not provided" }}
+            </p>
+
+        </div>
+
+    </div>
+
+</div>
+
+
+<script>
+
+let vapidPublicKey = "{{ vapid_public_key }}";
+
+
+function urlBase64ToUint8Array(base64String) {
+
+    const padding = "=".repeat(
+        (4 - base64String.length % 4) % 4
+    );
+
+    const base64 = (
+        base64String +
+        padding
+    )
+    .replace(/-/g, "+")
+    .replace(/_/g, "/");
+
+    const rawData = window.atob(base64);
+
+    return Uint8Array.from(
+        [...rawData].map(char => char.charCodeAt(0))
+    );
 }
 
 
-@app.route("/api/status")
+async function enableNotifications() {
+
+    try {
+
+        if (!("serviceWorker" in navigator)) {
+
+            alert(
+                "This browser does not support Service Workers."
+            );
+
+            return;
+        }
+
+
+        if (!("PushManager" in window)) {
+
+            alert(
+                "This browser does not support Web Push."
+            );
+
+            return;
+        }
+
+
+        const permission =
+            await Notification.requestPermission();
+
+
+        if (permission !== "granted") {
+
+            document.getElementById(
+                "notificationStatus"
+            ).innerText =
+                "Notification permission was denied.";
+
+            return;
+        }
+
+
+        const registration =
+            await navigator.serviceWorker.register(
+                "/sw.js"
+            );
+
+
+        const subscription =
+            await registration.pushManager.subscribe({
+
+                userVisibleOnly: true,
+
+                applicationServerKey:
+                    urlBase64ToUint8Array(
+                        vapidPublicKey
+                    )
+
+            });
+
+
+        const response = await fetch(
+            "/api/save-push-subscription",
+            {
+                method: "POST",
+
+                headers: {
+                    "Content-Type":
+                        "application/json"
+                },
+
+                body: JSON.stringify(
+                    subscription
+                )
+            }
+        );
+
+
+        const result =
+            await response.json();
+
+
+        if (result.success) {
+
+            document.getElementById(
+                "notificationStatus"
+            ).innerText =
+                "✅ Web Push notifications are enabled.";
+
+        } else {
+
+            document.getElementById(
+                "notificationStatus"
+            ).innerText =
+                "Could not save notification subscription.";
+
+        }
+
+
+    } catch (error) {
+
+        console.error(error);
+
+        document.getElementById(
+            "notificationStatus"
+        ).innerText =
+            "Notification setup failed.";
+
+    }
+
+}
+
+
+async function testFire() {
+
+    const response =
+        await fetch("/api/test-fire", {
+            method: "POST"
+        });
+
+    const result =
+        await response.json();
+
+    updateScreen(result);
+}
+
+
+async function resetSystem() {
+
+    const response =
+        await fetch("/api/reset", {
+            method: "POST"
+        });
+
+    const result =
+        await response.json();
+
+    updateScreen(result);
+}
+
+
+async function updateStatus() {
+
+    try {
+
+        const response =
+            await fetch("/status");
+
+        const data =
+            await response.json();
+
+        updateScreen(data);
+
+    } catch (error) {
+
+        console.log(error);
+
+    }
+
+}
+
+
+function updateScreen(data) {
+
+    document.getElementById(
+        "flame"
+    ).innerText = data.flame;
+
+
+    document.getElementById(
+        "temperature"
+    ).innerText =
+        data.temperature + "°C";
+
+
+    document.getElementById(
+        "extinguisher"
+    ).innerText =
+        data.extinguisher;
+
+
+    document.getElementById(
+        "notification"
+    ).innerText =
+        data.notification_sent
+            ? "SENT"
+            : "READY";
+
+
+    const status =
+        document.getElementById(
+            "systemStatus"
+        );
+
+
+    const alert =
+        document.getElementById(
+            "fireAlert"
+        );
+
+
+    if (data.fire) {
+
+        status.innerText =
+            "🔥 FIRE DETECTED";
+
+        status.style.background =
+            "#461515";
+
+        status.style.color =
+            "#ff6b5a";
+
+        document.getElementById(
+            "flame"
+        ).className =
+            "value danger";
+
+        alert.style.display =
+            "block";
+
+    } else {
+
+        status.innerText =
+            "● SYSTEM SAFE";
+
+        status.style.background =
+            "#12351d";
+
+        status.style.color =
+            "#67e58b";
+
+        document.getElementById(
+            "flame"
+        ).className =
+            "value safe";
+
+        alert.style.display =
+            "none";
+    }
+
+}
+
+
+updateStatus();
+
+setInterval(
+    updateStatus,
+    3000
+);
+
+</script>
+
+
+</body>
+
+</html>
+"""
+
+
+@app.route("/dashboard")
+def dashboard():
+
+    owner = get_current_owner()
+
+    if not owner:
+        return redirect(url_for("register"))
+
+    return render_template_string(
+        DASHBOARD_HTML,
+        owner=owner,
+        vapid_public_key=VAPID_PUBLIC_KEY
+    )
+
+
+# ---------------------------------------------------------
+# SAVE PUSH SUBSCRIPTION
+# ---------------------------------------------------------
+
+@app.route(
+    "/api/save-push-subscription",
+    methods=["POST"]
+)
+def save_push_subscription():
+
+    owner = get_current_owner()
+
+    if not owner:
+        return jsonify({
+            "success": False,
+            "error": "Not registered"
+        }), 401
+
+
+    subscription = request.get_json()
+
+    if not subscription:
+        return jsonify({
+            "success": False,
+            "error": "Invalid subscription"
+        }), 400
+
+
+    endpoint = subscription.get("endpoint")
+
+    if not endpoint:
+        return jsonify({
+            "success": False,
+            "error": "Missing endpoint"
+        }), 400
+
+
+    conn = get_db()
+
+
+    existing = conn.execute(
+        """
+        SELECT id
+        FROM push_subscriptions
+        WHERE endpoint = ?
+        """,
+        (endpoint,)
+    ).fetchone()
+
+
+    if existing:
+
+        conn.execute(
+            """
+            UPDATE push_subscriptions
+
+            SET owner_id = ?,
+                subscription_json = ?
+
+            WHERE endpoint = ?
+            """,
+            (
+                owner["id"],
+                json.dumps(subscription),
+                endpoint
+            )
+        )
+
+    else:
+
+        conn.execute(
+            """
+            INSERT INTO push_subscriptions
+            (
+                owner_id,
+                endpoint,
+                subscription_json,
+                created_at
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                owner["id"],
+                endpoint,
+                json.dumps(subscription),
+                datetime.utcnow().isoformat()
+            )
+        )
+
+
+    conn.commit()
+    conn.close()
+
+
+    return jsonify({
+        "success": True,
+        "message": "Push subscription saved"
+    })
+
+
+# ---------------------------------------------------------
+# FIRE DETECTION
+# ---------------------------------------------------------
+
+@app.route(
+    "/api/test-fire",
+    methods=["POST"]
+)
+def test_fire():
+
+    owner = get_current_owner()
+
+    if not owner:
+        return jsonify({
+            "error": "Not registered"
+        }), 401
+
+
+    fire_status["fire"] = True
+    fire_status["flame"] = "FIRE"
+    fire_status["temperature"] = 85
+    fire_status["extinguisher"] = "ON"
+    fire_status["notification_sent"] = False
+
+
+    sent = send_push_notification(
+        owner["id"]
+    )
+
+
+    fire_status["notification_sent"] = sent
+
+
+    return jsonify(fire_status)
+
+
+# ---------------------------------------------------------
+# RESET
+# ---------------------------------------------------------
+
+@app.route(
+    "/api/reset",
+    methods=["POST"]
+)
+def reset_system():
+
+    fire_status["fire"] = False
+    fire_status["flame"] = "SAFE"
+    fire_status["temperature"] = 0
+    fire_status["extinguisher"] = "OFF"
+    fire_status["notification_sent"] = False
+
+
+    return jsonify(fire_status)
+
+
+# ---------------------------------------------------------
+# REAL SENSOR API
+# ---------------------------------------------------------
+
+@app.route(
+    "/api/fire",
+    methods=["POST"]
+)
+def real_fire_detection():
+
+    owner = get_current_owner()
+
+    if not owner:
+        return jsonify({
+            "error": "Not registered"
+        }), 401
+
+
+    data = request.get_json() or {}
+
+
+    fire_status["fire"] = bool(
+        data.get("fire", True)
+    )
+
+    fire_status["flame"] = (
+        data.get("flame", "FIRE")
+    )
+
+    fire_status["temperature"] = (
+        data.get("temperature", 85)
+    )
+
+    fire_status["extinguisher"] = (
+        data.get("extinguisher", "ON")
+    )
+
+
+    if fire_status["fire"]:
+
+        sent = send_push_notification(
+            owner["id"]
+        )
+
+        fire_status["notification_sent"] = sent
+
+    else:
+
+        fire_status["notification_sent"] = False
+
+
+    return jsonify({
+        "success": True,
+        "status": fire_status
+    })
+
+
+# ---------------------------------------------------------
+# STATUS
+# ---------------------------------------------------------
+
+@app.route("/status")
 def status():
 
     return jsonify(fire_status)
 
 
-@app.route("/api/reset", methods=["POST"])
-@login_required
-def reset():
+# ---------------------------------------------------------
+# PROFILE
+# ---------------------------------------------------------
 
-    fire_status.update({
-        "fire": False,
-        "flame": "SAFE",
-        "temperature": 0,
-        "extinguisher": "OFF"
-    })
+PROFILE_HTML = """
+<!DOCTYPE html>
 
-    return jsonify({
-        "ok": True,
-        "message": "System reset successfully."
-    })
+<html>
+
+<head>
+
+<meta name="viewport"
+      content="width=device-width, initial-scale=1">
+
+<title>Owner Details</title>
+
+<style>
+
+body {
+    margin: 0;
+
+    padding: 30px;
+
+    font-family: Arial;
+
+    background: #090909;
+
+    color: white;
+}
+
+.card {
+    max-width: 600px;
+
+    margin: auto;
+
+    background: #151515;
+
+    padding: 30px;
+
+    border-radius: 20px;
+}
+
+input {
+    width: 100%;
+
+    padding: 13px;
+
+    margin:
+        8px
+        0
+        15px;
+
+    box-sizing: border-box;
+
+    background: #0b0b0b;
+
+    border: 1px solid #444;
+
+    border-radius: 9px;
+
+    color: white;
+}
+
+button {
+    width: 100%;
+
+    padding: 14px;
+
+    border: 0;
+
+    border-radius: 10px;
+
+    background: #e64228;
+
+    color: white;
+
+    font-weight: bold;
+}
+
+a {
+    display: block;
+
+    margin-top: 15px;
+
+    color: #ff654e;
+
+    text-decoration: none;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="card">
+
+<h1>👤 Owner Details</h1>
+
+<form method="POST">
+
+<input
+    name="name"
+    value="{{ owner['name'] }}"
+    placeholder="Name"
+    required
+>
+
+<input
+    name="phone"
+    value="{{ owner['phone'] or '' }}"
+    placeholder="Phone"
+>
+
+<input
+    name="email"
+    value="{{ owner['email'] or '' }}"
+    placeholder="Email"
+>
+
+<input
+    name="location"
+    value="{{ owner['location'] or '' }}"
+    placeholder="Location"
+>
+
+<input
+    name="device_id"
+    value="{{ owner['device_id'] or '' }}"
+    placeholder="Device ID"
+>
+
+<button>
+    SAVE CHANGES
+</button>
+
+</form>
+
+<a href="/dashboard">
+    ← Back to Dashboard
+</a>
+
+</div>
+
+</body>
+
+</html>
+"""
 
 
-# ============================================================
-# TEST FIRE
-# ============================================================
+@app.route(
+    "/profile",
+    methods=["GET", "POST"]
+)
+def profile():
 
-@app.route("/api/test-fire", methods=["POST"])
-@login_required
-def test_fire():
+    owner = get_current_owner()
 
-    user = get_current_user()
-    data = request.get_json(silent=True) or {}
-
-    latitude = data.get("latitude")
-    longitude = data.get("longitude")
-    accuracy = data.get("accuracy", 0)
-
-    if latitude is None or longitude is None:
-        return jsonify({
-            "ok": False,
-            "error": "Current location is required."
-        }), 400
-
-    conn = get_db()
-
-    cursor = conn.execute("""
-        INSERT INTO fire_alerts
-        (user_id, device_id, latitude, longitude, accuracy,
-         temperature, source, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        user["id"],
-        user["device_id"],
-        float(latitude),
-        float(longitude),
-        float(accuracy or 0),
-        50,
-        "website",
-        utc_now()
-    ))
-
-    conn.commit()
-    conn.close()
-
-    fire_status.update({
-        "fire": True,
-        "flame": "FIRE DETECTED",
-        "temperature": 50,
-        "extinguisher": "ON"
-    })
-
-    return jsonify({
-        "ok": True,
-        "alert_id": cursor.lastrowid
-    })
+    if not owner:
+        return redirect(url_for("register"))
 
 
-# ============================================================
-# ESP8266 FIRE ENDPOINT
-# ============================================================
+    if request.method == "POST":
 
-@app.route("/api/fire", methods=["POST"])
-def esp_fire():
+        name = request.form.get(
+            "name",
+            ""
+        ).strip()
 
-    data = request.get_json(silent=True) or {}
+        phone = request.form.get(
+            "phone",
+            ""
+        ).strip()
 
-    device_id = str(data.get("device_id", "")).strip()
-    detected = bool(data.get("fire", False))
-    temperature = float(data.get("temperature", 0))
+        email = request.form.get(
+            "email",
+            ""
+        ).strip()
 
-    if not device_id:
-        return jsonify({
-            "ok": False,
-            "error": "device_id is required."
-        }), 400
+        location = request.form.get(
+            "location",
+            ""
+        ).strip()
 
-    conn = get_db()
+        device_id = request.form.get(
+            "device_id",
+            ""
+        ).strip()
 
-    user = conn.execute(
-        "SELECT * FROM users WHERE device_id = ?",
-        (device_id,)
-    ).fetchone()
 
-    if not user:
-        conn.close()
-        return jsonify({
-            "ok": False,
-            "error": "Device is not registered."
-        }), 404
+        conn = get_db()
 
-    if detected:
+        conn.execute(
+            """
+            UPDATE owners
 
-        # ESP8266 itself may not have a browser location.
-        # If coordinates are supplied by the hardware/client,
-        # store them. Otherwise latitude/longitude remain NULL.
-        latitude = data.get("latitude")
-        longitude = data.get("longitude")
+            SET name = ?,
+                phone = ?,
+                email = ?,
+                location = ?,
+                device_id = ?
 
-        conn.execute("""
-            INSERT INTO fire_alerts
-            (user_id, device_id, latitude, longitude, accuracy,
-             temperature, source, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            user["id"],
-            device_id,
-            latitude,
-            longitude,
-            data.get("accuracy", 0),
-            temperature,
-            "esp8266",
-            utc_now()
-        ))
+            WHERE id = ?
+            """,
+            (
+                name,
+                phone,
+                email,
+                location,
+                device_id,
+                owner["id"]
+            )
+        )
 
         conn.commit()
-
-        fire_status.update({
-            "fire": True,
-            "flame": "FIRE DETECTED",
-            "temperature": temperature,
-            "extinguisher": "ON"
-        })
-
-    else:
-        fire_status.update({
-            "fire": False,
-            "flame": "SAFE",
-            "temperature": temperature,
-            "extinguisher": "OFF"
-        })
-
-    conn.close()
-
-    return jsonify({"ok": True})
+        conn.close()
 
 
-# ============================================================
-# ALERT HISTORY
-# ============================================================
-
-@app.route("/api/alerts")
-@login_required
-def alerts():
-
-    conn = get_db()
-
-    rows = conn.execute("""
-        SELECT id, device_id, latitude, longitude,
-               temperature, source, created_at
-        FROM fire_alerts
-        ORDER BY id DESC
-        LIMIT 50
-    """).fetchall()
-
-    conn.close()
-
-    return jsonify([dict(row) for row in rows])
+        return redirect(
+            url_for("profile")
+        )
 
 
-# ============================================================
-# MAINTENANCE
-#
-# ADMIN DEMO:
-# Set ADMIN_EMAIL and ADMIN_PASSWORD in Render.
-# Then visit:
-# POST /api/admin/maintenance
-# with JSON:
-# {"title":"Maintenance","message":"System maintenance tonight."}
-#
-# A small admin page is also provided below.
-# ============================================================
-
-@app.route("/api/maintenance")
-@login_required
-def maintenance():
-
-    conn = get_db()
-
-    rows = conn.execute("""
-        SELECT id, title, message, created_at
-        FROM maintenance
-        ORDER BY id DESC
-        LIMIT 50
-    """).fetchall()
-
-    conn.close()
-
-    return jsonify([dict(row) for row in rows])
-
-
-def is_admin():
-    user = get_current_user()
-    admin_email = os.environ.get("ADMIN_EMAIL", "").strip().lower()
-
-    return bool(
-        user and
-        admin_email and
-        user["email"].lower() == admin_email
+    return render_template_string(
+        PROFILE_HTML,
+        owner=owner
     )
 
 
-@app.route("/admin")
-def admin_page():
+# ---------------------------------------------------------
+# LOGOUT
+# ---------------------------------------------------------
 
-    if not is_admin():
-        return """
-        <h2>Admin Login Required</h2>
-        <p>Login to the main website using the configured ADMIN_EMAIL.</p>
-        """
+@app.route("/logout")
+def logout():
 
-    return """
-    <h1>🔥 Smart Fire Guard Admin</h1>
+    session.clear()
 
-    <form method="post" action="/api/admin/maintenance">
-        <input name="title" placeholder="Maintenance title" required>
-        <br><br>
-        <textarea name="message"
-                  placeholder="Maintenance message"
-                  required></textarea>
-        <br><br>
-        <button type="submit">Send Maintenance Notice</button>
-    </form>
-    """
+    return redirect(
+        url_for("register")
+    )
 
 
-@app.route("/api/admin/maintenance", methods=["POST"])
-def create_maintenance():
-
-    if not is_admin():
-        return jsonify({
-            "ok": False,
-            "error": "Admin access required."
-        }), 403
-
-    data = request.get_json(silent=True)
-
-    if data:
-        title = str(data.get("title", "")).strip()
-        message = str(data.get("message", "")).strip()
-    else:
-        title = str(request.form.get("title", "")).strip()
-        message = str(request.form.get("message", "")).strip()
-
-    if not title or not message:
-        return jsonify({
-            "ok": False,
-            "error": "Title and message are required."
-        }), 400
-
-    conn = get_db()
-
-    cursor = conn.execute("""
-        INSERT INTO maintenance
-        (title, message, created_at)
-        VALUES (?, ?, ?)
-    """, (
-        title,
-        message,
-        utc_now()
-    ))
-
-    conn.commit()
-    conn.close()
-
-    return jsonify({
-        "ok": True,
-        "id": cursor.lastrowid
-    })
-
-
-# ============================================================
-# LIVE EVENT POLLING
-#
-# No Firebase.
-# Every open dashboard asks this endpoint for new events.
-# ============================================================
-
-@app.route("/api/events")
-@login_required
-def events():
-
-    try:
-        after = int(request.args.get("after", 0))
-    except ValueError:
-        after = 0
-
-    try:
-        maintenance_after = int(
-            request.args.get("maintenance_after", 0)
-        )
-    except ValueError:
-        maintenance_after = 0
-
-    conn = get_db()
-
-    alerts_rows = conn.execute("""
-        SELECT id, device_id, latitude, longitude,
-               temperature, source, created_at
-        FROM fire_alerts
-        WHERE id > ?
-        ORDER BY id ASC
-        LIMIT 30
-    """, (after,)).fetchall()
-
-    maintenance_rows = conn.execute("""
-        SELECT id, title, message, created_at
-        FROM maintenance
-        WHERE id > ?
-        ORDER BY id ASC
-        LIMIT 30
-    """, (maintenance_after,)).fetchall()
-
-    conn.close()
-
-    return jsonify({
-        "alerts": [dict(row) for row in alerts_rows],
-        "maintenance": [dict(row) for row in maintenance_rows]
-    })
-
-
-# ============================================================
-# HEALTH CHECK
-# ============================================================
-
-@app.route("/health")
-def health():
-
-    return jsonify({
-        "ok": True,
-        "firebase": False,
-        "database": "SQLite",
-        "notifications": "Browser live polling"
-    })
-
-
-# ============================================================
+# ---------------------------------------------------------
 # RUN
-# ============================================================
+# ---------------------------------------------------------
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            5000
+        )
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
